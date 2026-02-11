@@ -1,70 +1,75 @@
-from dataclasses import dataclass, field
-from typing import List
+# -*- coding: utf-8 -*-
+import os
+import random
+from dataclasses import dataclass
+
+import torch
+import torch.backends.cudnn as cudnn
+
+
+USE_COMPILE = False
+COMPILE_MODE = "max-autotune"
+
+BASE_DIR = "/root/lm_merge/qwen3_0.6b_z4096"
+PARQUET_PATH = "/root/data/wiki_en_sentences_flat.parquet"
+OUTPUT_DIR = "/root/lm_merge/train_runs/concept_first_v1"
+
+BATCH_SIZE = 48
+GRAD_ACCUM = 4
+EPOCHS = 3
+LR = 3e-4
+WARMUP_RATIO = 0.1
+MAX_INPUT_TOKENS = 96
+SEED = 42
+SAVE_STEPS = 1000
+LOG_STEPS = 100
+
+TAU_INIT = 0.8
+TAU_MIN = 0.2
+MIN_CONCEPT_STEPS = 1
+
+LAMBDA_REC = 1.0
+LAMBDA_COMMIT = 0.5
+LAMBDA_UNIF = 0.2
+LAMBDA_EOS = 0.2
+LAMBDA_LEN = 0.2
+BETA_COMMIT = 0.5
+EPS = 1e-8
+
+# 0 is reserved for "normal text / neutral type".
+TYPE_ID_TEXT = 0
 
 
 @dataclass
-class PathConfig:
-    base_dir: str = "/root/lm_merge/qwen3_0.6b_z4096"
-    parquet_path: str = "/root/data/wiki_en_sentences_flat.parquet"
-    output_dir: str = "/root/lm_merge/train_runs/qwen_online_concept_v2"
+class ConceptTypeConfig:
+    name: str
+    size: int
+    max_steps: int
+    target_ratio: float
 
 
-@dataclass
-class TrainConfig:
-    max_samples: int = 100000
-    max_input_tokens: int = 64
-    batch_size: int = 8
-    grad_accum: int = 2
-    epochs: int = 1
-    lr: float = 2e-4
-    warmup_ratio: float = 0.05
-    weight_decay: float = 0.01
-    log_steps: int = 20
-    save_steps: int = 500
-    seed: int = 42
-    tau_init: float = 1.0
-    tau_min: float = 0.5
-    num_workers: int = 4
+CONCEPT_TYPE_CONFIGS = [
+    ConceptTypeConfig(name="bottom", size=2048, max_steps=1000, target_ratio=0.45),
+    ConceptTypeConfig(name="mid", size=256, max_steps=500, target_ratio=0.05),
+    ConceptTypeConfig(name="top", size=32, max_steps=500, target_ratio=0.01),
+]
 
 
-@dataclass
-class ModelConfig:
-    concept_vocab_size: int = 4096
-    shallow_layers: int = 8
-    middle_layers: int = 8
-    tail_mlp_hidden_ratio: int = 2
-    very_neg: float = -1e4
-    eps: float = 1e-8
-    compression_ratio: float = 0.3
-    beta_commit: float = 0.5
-    lambda_rec: float = 1.0
-    lambda_commit: float = 1.0
-    lambda_unif: float = 2.0
-    lambda_len: float = 0.1
+def apply_runtime_settings() -> None:
+    """apply runtime perf switches and deterministic seeds."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    cudnn.benchmark = True
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_cache")
+
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
 
-@dataclass
-class AdapterConfig:
-    r: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    target_candidates: List[str] = field(
-        default_factory=lambda: [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-    )
-
-
-@dataclass
-class ExperimentConfig:
-    paths: PathConfig = field(default_factory=PathConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    adapter: AdapterConfig = field(default_factory=AdapterConfig)
-
+apply_runtime_settings()
