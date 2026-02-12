@@ -39,6 +39,25 @@ EPS = 1e-8
 # 0 is reserved for "normal text / neutral type".
 TYPE_ID_TEXT = 0
 
+# LoRA
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+LORA_MODULES_TO_SAVE = ["embed_tokens", "lm_head"]
+
+# Resume
+RESUME_ENABLED = False
+RESUME_CHECKPOINT_DIR = ""
+
 
 @dataclass
 class ConceptTypeConfig:

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import logging
 import math
 import os
@@ -13,84 +13,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
-try:
-    from .config import (
-        BASE_DIR,
-        BATCH_SIZE,
-        COMPILE_MODE,
-        CONCEPT_TYPE_CONFIGS,
-        EPOCHS,
-        GRAD_ACCUM,
-        LAMBDA_COMMIT,
-        LAMBDA_EOS,
-        LAMBDA_LEN,
-        LAMBDA_REC,
-        LAMBDA_UNIF,
-        LOG_STEPS,
-        LR,
-        MAX_INPUT_TOKENS,
-        MIN_CONCEPT_STEPS,
-        OUTPUT_DIR,
-        PARQUET_PATH,
-        SAVE_STEPS,
-        TAU_INIT,
-        TAU_MIN,
-        TYPE_ID_TEXT,
-        USE_COMPILE,
-        WARMUP_RATIO,
-    )
-    from .model import (
-        ConceptMaskCache,
-        ConceptTypeMeta,
-        SharedBackboneTwoHeads,
-        build_concept_metas,
-        build_concept_special_tokens,
-        build_decoder_tensors,
-        build_executor_blocklist,
-        build_executor_prefix,
-        compute_planner_losses,
-        plan_concepts,
-    )
-except ImportError:
-    from config import (
-        BASE_DIR,
-        BATCH_SIZE,
-        COMPILE_MODE,
-        CONCEPT_TYPE_CONFIGS,
-        EPOCHS,
-        GRAD_ACCUM,
-        LAMBDA_COMMIT,
-        LAMBDA_EOS,
-        LAMBDA_LEN,
-        LAMBDA_REC,
-        LAMBDA_UNIF,
-        LOG_STEPS,
-        LR,
-        MAX_INPUT_TOKENS,
-        MIN_CONCEPT_STEPS,
-        OUTPUT_DIR,
-        PARQUET_PATH,
-        SAVE_STEPS,
-        TAU_INIT,
-        TAU_MIN,
-        TYPE_ID_TEXT,
-        USE_COMPILE,
-        WARMUP_RATIO,
-    )
-    from model import (
-        ConceptMaskCache,
-        ConceptTypeMeta,
-        SharedBackboneTwoHeads,
-        build_concept_metas,
-        build_concept_special_tokens,
-        build_decoder_tensors,
-        build_executor_blocklist,
-        build_executor_prefix,
-        compute_planner_losses,
-        plan_concepts,
-    )
-
+from src.config import *
+from src.model import *
 
 def setup_logging(output_dir: str) -> str:
     """configure file+stdout logging and return the log file path."""
@@ -192,13 +118,16 @@ class CUDAPrefetcher:
         return batch
 
 def save_checkpoint(
-    model: SharedBackboneTwoHeads,
+    model: SharedBackboneUnifiedHead,
     tokenizer: AutoTokenizer,
     metas: List[ConceptTypeMeta],
     step: int,
     output_dir: str,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
 ):
-    """persist backbone/tokenizer and lightweight two-head planner metadata."""
+    """persist backbone/tokenizer and lightweight planner metadata."""
     save_name = f"checkpoint-{step}" if isinstance(step, int) else str(step)
     save_dir = os.path.join(output_dir, save_name)
     backbone_dir = os.path.join(save_dir, "backbone")
@@ -221,8 +150,7 @@ def save_checkpoint(
 
     torch.save(
         {
-            "planner_head": model.planner_head.state_dict(),
-            "executor_head": model.executor_head.state_dict(),
+            "output_head": model.output_head.state_dict(),
             "type_embed": model.type_embed.state_dict(),
             "concept_metas": meta_dump,
             "step": step,
@@ -230,15 +158,39 @@ def save_checkpoint(
         },
         os.path.join(save_dir, "two_stage_heads.pt"),
     )
+    if optimizer is not None and scheduler is not None and isinstance(step, int):
+        trainer_state = {
+            "step": step,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }
+        if scaler is not None and scaler.is_enabled():
+            trainer_state["scaler"] = scaler.state_dict()
+        torch.save(trainer_state, os.path.join(save_dir, "trainer_state.pt"))
     logging.info(f"[SAVE] checkpoint saved to: {save_dir}")
 
 def train():
-    """run two-stage concept-first training with a shared backbone and two heads."""
+    """run two-stage concept-first training with a shared backbone and one output head."""
     log_file = setup_logging(OUTPUT_DIR)
     logging.info(f"[INFO] log file: {log_file}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"[INFO] device: {device}")
+    resume_ckpt_dir = RESUME_CHECKPOINT_DIR.strip()
+    resume_backbone_dir = os.path.join(resume_ckpt_dir, "backbone") if resume_ckpt_dir else ""
+    resume_heads_path = os.path.join(resume_ckpt_dir, "two_stage_heads.pt") if resume_ckpt_dir else ""
+    resume_trainer_state_path = os.path.join(resume_ckpt_dir, "trainer_state.pt") if resume_ckpt_dir else ""
+    resume_step = 0
+    if RESUME_ENABLED:
+        if not resume_ckpt_dir:
+            raise RuntimeError("RESUME_ENABLED=True but RESUME_CHECKPOINT_DIR is empty.")
+        if not os.path.isdir(resume_ckpt_dir):
+            raise RuntimeError(f"Resume checkpoint dir not found: {resume_ckpt_dir}")
+        if not os.path.isdir(resume_backbone_dir):
+            raise RuntimeError(f"Resume backbone dir not found: {resume_backbone_dir}")
+        if not os.path.isfile(resume_heads_path):
+            raise RuntimeError(f"Resume heads file not found: {resume_heads_path}")
+        logging.info(f"[INFO] resume enabled from: {resume_ckpt_dir}")
 
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
     tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True)
@@ -256,14 +208,50 @@ def train():
         "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
     }
     if torch.cuda.is_available():
-        # Optional acceleration when current GPU/runtime supports FA2.
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+        # Optional acceleration when current GPU/runtime supports FA.
+        model_kwargs["attn_implementation"] = "sdpa"
     model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
+    base_vocab_size = model_base.get_input_embeddings().num_embeddings
+    # HF 默认保留旧行、只初始化新增行
     model_base.resize_token_embeddings(len(tokenizer))
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+        modules_to_save=LORA_MODULES_TO_SAVE,
+    )
+    if RESUME_ENABLED:
+        model_base = PeftModel.from_pretrained(model_base, resume_backbone_dir, is_trainable=True).to(device)
+    else:
+        model_base = get_peft_model(model_base, lora_cfg)
+    model_base.print_trainable_parameters()
 
     metas = build_concept_metas(tokenizer, CONCEPT_TYPE_CONFIGS, device=device)
     num_type_embeddings = 1 + len(metas)
-    model = SharedBackboneTwoHeads(model_base, num_type_embeddings=num_type_embeddings).to(device)
+    model = SharedBackboneUnifiedHead(
+        model_base,
+        num_type_embeddings=num_type_embeddings,
+        frozen_output_head_prefix_rows=base_vocab_size,
+    ).to(device)
+    if RESUME_ENABLED:
+        head_state = torch.load(resume_heads_path, map_location=device)
+        if "output_head" in head_state:
+            model.output_head.load_state_dict(head_state["output_head"])
+        elif "executor_head" in head_state:
+            model.output_head.load_state_dict(head_state["executor_head"])
+            logging.warning("[WARN] loaded legacy executor_head into unified output_head")
+        elif "planner_head" in head_state:
+            model.output_head.load_state_dict(head_state["planner_head"])
+            logging.warning("[WARN] loaded legacy planner_head into unified output_head")
+        else:
+            raise RuntimeError("No output head state found in checkpoint.")
+        model.type_embed.load_state_dict(head_state["type_embed"])
+        saved_step = head_state.get("step", 0)
+        if isinstance(saved_step, int):
+            resume_step = saved_step
 
     if USE_COMPILE:
         try:
@@ -280,6 +268,7 @@ def train():
         blocked_for_executor=blocked_ids,
         device=device,
     )
+    logging.info(f"[INFO] Model and tokenizer initialized. Starting data loading...")
 
     dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
     collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
@@ -309,17 +298,55 @@ def train():
             persistent_workers=True,
         )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.01)
+    optim_params = [p for p in model.parameters() if p.requires_grad]
+    if not optim_params:
+        raise RuntimeError("No trainable parameters found. Check LoRA/parameter-freeze setup.")
+    output_head_param = model.output_head.weight
+    base_params = [p for p in optim_params if id(p) != id(output_head_param)]
+    optimizer_groups = []
+    if base_params:
+        optimizer_groups.append(
+            {"params": base_params, "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.01}
+        )
+    optimizer_groups.append(
+        {"params": [output_head_param], "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.0}
+    )
+    optimizer = torch.optim.AdamW(optimizer_groups)
     total_steps = math.ceil(len(dataloader) / GRAD_ACCUM) * EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if torch.cuda.is_available() else None
+    if RESUME_ENABLED and os.path.isfile(resume_trainer_state_path):
+        trainer_state = torch.load(resume_trainer_state_path, map_location="cpu")
+        if "optimizer" in trainer_state:
+            optimizer.load_state_dict(trainer_state["optimizer"])
+        if "scheduler" in trainer_state:
+            scheduler.load_state_dict(trainer_state["scheduler"])
+        if scaler is not None and scaler.is_enabled() and "scaler" in trainer_state:
+            scaler.load_state_dict(trainer_state["scaler"])
+        resume_step = int(trainer_state.get("step", resume_step))
+    elif RESUME_ENABLED:
+        logging.warning(
+            f"[WARN] trainer_state.pt not found at {resume_trainer_state_path}, "
+            "resume without optimizer/scheduler/scaler state"
+        )
 
     logging.info(f"[INFO] vocab size: {vocab_size}")
+    logging.info(f"[INFO] output_head frozen rows: [0, {base_vocab_size})")
+    new_rows = max(0, vocab_size - base_vocab_size)
+    effective_head_params = new_rows * model.output_head.weight.shape[1]
+    logging.info(
+        f"[INFO] output_head trainable rows: [{base_vocab_size}, {vocab_size}) "
+        f"({new_rows} rows, {effective_head_params:,} params)"
+    )
     logging.info(f"[INFO] concept types: {[m.name for m in metas]}")
     logging.info(f"[INFO] steps: total={total_steps}, warmup={warmup_steps}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    all_params = sum(p.numel() for p in model.parameters())
+    ratio = 100.0 * trainable_params / max(1, all_params)
+    logging.info(f"[INFO] trainable params: {trainable_params:,} / {all_params:,} ({ratio:.4f}%)")
 
     model.train()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -328,7 +355,7 @@ def train():
     progress_bar = tqdm(total=total_batches, desc="training", unit="step")
     start_time = time.time()
 
-    global_step = 0
+    global_step = resume_step
     for epoch in range(EPOCHS):
         epoch_losses: List[float] = []
         optimizer.zero_grad(set_to_none=True)
@@ -405,7 +432,7 @@ def train():
                     use_cache=False,
                 )
                 hidden = out.last_hidden_state[:, prefix_embeds.size(1) :, :]
-                logits = model.executor_head(hidden)
+                logits = model.output_head(hidden)
                 # Executor should not produce planner-only tokens.
                 logits = logits.masked_fill(mask_cache.executor_block_bool.view(1, 1, -1), -1e4)
 
@@ -502,7 +529,16 @@ def train():
                     )
 
                 if global_step % SAVE_STEPS == 0:
-                    save_checkpoint(model, tokenizer, metas, global_step, OUTPUT_DIR)
+                    save_checkpoint(
+                        model,
+                        tokenizer,
+                        metas,
+                        global_step,
+                        OUTPUT_DIR,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                    )
 
             progress_bar.update(1)
             elapsed = time.time() - start_time
@@ -518,7 +554,16 @@ def train():
     progress_bar.close()
     total_time = timedelta(seconds=int(time.time() - start_time))
     logging.info(f"[DONE] training complete, total time: {total_time}")
-    save_checkpoint(model, tokenizer, metas, "final", OUTPUT_DIR)
+    save_checkpoint(
+        model,
+        tokenizer,
+        metas,
+        "final",
+        OUTPUT_DIR,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+    )
 
 if __name__ == "__main__":
     train()

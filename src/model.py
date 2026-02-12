@@ -79,9 +79,14 @@ class ConceptMaskCache:
             ids = torch.tensor(sorted(set(blocked_for_executor)), device=device, dtype=torch.long)
             self.executor_block_bool[ids] = True
 
-class SharedBackboneTwoHeads(nn.Module):
-    def __init__(self, base_model: AutoModelForCausalLM, num_type_embeddings: int):
-        """wrap one shared backbone with independent planner/executor output heads."""
+class SharedBackboneUnifiedHead(nn.Module):
+    def __init__(
+        self,
+        base_model: AutoModelForCausalLM,
+        num_type_embeddings: int,
+        frozen_output_head_prefix_rows: int = 0,
+    ):
+        """wrap one shared backbone with one unified output head."""
         super().__init__()
         if not hasattr(base_model, "model"):
             raise RuntimeError("Expected a causal LM with `.model` backbone (Qwen/LLaMA-style).")
@@ -92,18 +97,38 @@ class SharedBackboneTwoHeads(nn.Module):
         vocab_size = self.token_embed.num_embeddings
         hidden_size = self.token_embed.embedding_dim
 
-        self.planner_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.executor_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.output_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.type_embed = nn.Embedding(num_type_embeddings, hidden_size)
 
-        if out_embed is not None and out_embed.weight.shape == self.planner_head.weight.shape:
-            self.planner_head.weight.data.copy_(out_embed.weight.data)
-            self.executor_head.weight.data.copy_(out_embed.weight.data)
+        if out_embed is not None and out_embed.weight.shape == self.output_head.weight.shape:
+            self.output_head.weight.data.copy_(out_embed.weight.data)
         else:
-            self.planner_head.weight.data.copy_(self.token_embed.weight.data)
-            self.executor_head.weight.data.copy_(self.token_embed.weight.data)
+            self.output_head.weight.data.copy_(self.token_embed.weight.data)
 
         nn.init.zeros_(self.type_embed.weight)
+        self.register_buffer("_output_head_grad_mask", None, persistent=False)
+        if frozen_output_head_prefix_rows > 0:
+            self.freeze_output_head_prefix_rows(frozen_output_head_prefix_rows)
+
+    def freeze_output_head_prefix_rows(self, frozen_rows: int):
+        """freeze [0:frozen_rows) rows in output head and keep remaining rows trainable."""
+        vocab_size = self.output_head.weight.shape[0]
+        if frozen_rows <= 0:
+            self._output_head_grad_mask = None
+            return
+        if frozen_rows >= vocab_size:
+            raise ValueError(
+                f"frozen_rows must be in [0, vocab_size), got {frozen_rows} for vocab_size={vocab_size}"
+            )
+        mask = torch.ones((vocab_size, 1), dtype=self.output_head.weight.dtype, device=self.output_head.weight.device)
+        mask[:frozen_rows] = 0
+        self._output_head_grad_mask = mask
+        self.output_head.weight.register_hook(self._mask_output_head_grad)
+
+    def _mask_output_head_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        if grad is None or self._output_head_grad_mask is None:
+            return grad
+        return grad * self._output_head_grad_mask.to(dtype=grad.dtype)
 
     def embed_with_type(self, token_ids: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
         """compose token embeddings with additive type embeddings."""
@@ -180,7 +205,7 @@ def build_concept_metas(
     return metas
 
 def plan_concepts(
-    model: SharedBackboneTwoHeads,
+    model: SharedBackboneUnifiedHead,
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -228,7 +253,7 @@ def plan_concepts(
         position_ids=planner_pos,
         use_cache=True,
     )
-    logits_t = model.planner_head(out.last_hidden_state[:, -1, :])  # [B, V]
+    logits_t = model.output_head(out.last_hidden_state[:, -1, :])  # [B, V]
     past_kv = out.past_key_values
 
     num_types = len(metas)
@@ -421,7 +446,7 @@ def plan_concepts(
             past_key_values=past_kv,
             use_cache=True,
         )
-        logits_t = model.planner_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
+        logits_t = model.output_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
         past_kv = out_next.past_key_values
 
     # ---------------------------------------------------------------------
@@ -452,7 +477,7 @@ def plan_concepts(
     return PlannerOutput(per_type=per_type_outputs)
 
 def build_executor_prefix(
-    model: SharedBackboneTwoHeads,
+    model: SharedBackboneUnifiedHead,
     *,
     planner_out: PlannerOutput,
     metas: List[ConceptTypeMeta],
@@ -522,6 +547,10 @@ def build_decoder_tensors(
         decoder_mask[b, : lb + 1] = 1                     # 有效区间长度是 lb+1
 
     return decoder_in, decoder_mask, labels, lengths
+
+
+# Backward-compatible alias for older imports.
+SharedBackboneTwoHeads = SharedBackboneUnifiedHead
 
 def compute_planner_losses(
     planner_out: PlannerOutput,
