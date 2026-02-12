@@ -35,6 +35,9 @@ LAMBDA_EOS = 0.2
 LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
 EPS = 1e-8
+QUOTA_TAU = 0.15
+QUOTA_ETA = 0.01
+QUOTA_LAMBDA_INIT = 0.0
 
 # 0 is reserved for "normal text / neutral type".
 TYPE_ID_TEXT = 0
@@ -52,7 +55,7 @@ LORA_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
-LORA_MODULES_TO_SAVE = ["embed_tokens", "lm_head"]
+LORA_MODULES_TO_SAVE = []
 
 # Resume
 RESUME_ENABLED = False

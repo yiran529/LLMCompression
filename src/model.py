@@ -56,6 +56,7 @@ class ConceptMaskCache:
         self,
         metas: List[ConceptTypeMeta],
         vocab_size: int,
+        base_vocab_size: int,
         blocked_for_executor: List[int],
         device: str,
     ):
@@ -67,7 +68,9 @@ class ConceptMaskCache:
         very_neg = -1e4
         for meta in metas:
             bias = torch.full((vocab_size,), very_neg, device=device, dtype=torch.float32)
-            # 当前 type 只允许输出：该 type 的概念 token + 该 type 的 EOS token。
+            # 允许输出：原词表 token + 该 type 的概念 token + 该 type 的 EOS token。
+            if base_vocab_size > 0:
+                bias[:base_vocab_size] = 0.0
             bias[meta.concept_ids_with_eos] = 0.0
             self.allowed_logits_bias[meta.name] = bias
 
@@ -166,6 +169,41 @@ class PlannerTypeOutput:
 @dataclass
 class PlannerOutput:
     per_type: List[PlannerTypeOutput]
+    quota_mass_sum: torch.Tensor
+    quota_count: torch.Tensor
+
+class PlannerQuotaController:
+    def __init__(self, *, tau: float, eta: float, lambda_init: float, device: str):
+        self.tau = float(tau)
+        self.eta = float(eta)
+        self.lambda_value = torch.tensor(lambda_init, device=device, dtype=torch.float32)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {"lambda_value": self.lambda_value.detach().cpu()}
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor], device: str) -> None:
+        if "lambda_value" in state:
+            self.lambda_value = state["lambda_value"].to(device=device, dtype=torch.float32)
+
+    def compute_loss(self, quota_mass_sum: torch.Tensor, quota_count: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if quota_count.item() < 0.5:
+            zero = torch.zeros((), device=quota_mass_sum.device, dtype=torch.float32)
+            return zero, zero
+        bar_m = quota_mass_sum / quota_count
+        loss_quota = self.lambda_value.detach() * F.relu(bar_m - self.tau)
+        with torch.no_grad():
+            self.lambda_value.add_(self.eta * (bar_m.detach() - self.tau))
+            self.lambda_value.clamp_(min=0.0)
+        return loss_quota, bar_m
+
+def compute_planner_quota_loss(
+    planner_out: PlannerOutput,
+    quota_controller: PlannerQuotaController,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if quota_controller is None:
+        zero = torch.zeros((), device=planner_out.quota_mass_sum.device, dtype=torch.float32)
+        return zero, zero
+    return quota_controller.compute_loss(planner_out.quota_mass_sum, planner_out.quota_count)
 
 def build_concept_special_tokens(type_cfgs: List[ConceptTypeConfig]) -> List[str]:
     """define all planner-side special tokens for typed concept vocabularies."""
@@ -215,6 +253,7 @@ def plan_concepts(
     mask_cache: ConceptMaskCache,
     tau: float,
     min_concept_steps: int,
+    base_vocab_size: int,
     device: str,
 ) -> PlannerOutput:
     """generate one variable-length concept sequence per type from source input."""
@@ -317,6 +356,8 @@ def plan_concepts(
     # Hard safety bound with max_steps constraint preserved.
     # A sample can emit at most sum(max_steps_i) tokens across all types.
     max_total_steps = int(max_steps_by_type.sum().item())
+    quota_mass_sum = torch.zeros((), device=device, dtype=torch.float32)
+    quota_count = torch.zeros((), device=device, dtype=torch.float32)
 
     # ---------------------------------------------------------------------
     # 5) Main asynchronous decoding loop.
@@ -397,6 +438,20 @@ def plan_concepts(
             buffers[t]["valid"][rows, local_step] = 1
             buffers[t]["eos_logits"][rows, local_step] = masked_logits[rows, eos_t]
 
+            # Used for computing quota loss later.
+            if base_vocab_size > 0:
+                rows_logits = masked_logits[rows]
+                # 原词表 + 当前concept tokens词表（包含EOS）一起构成分母，计算EOS占比。
+                logz = torch.logsumexp(rows_logits, dim=-1)
+                # 原词表部分的概率质量总和，作为“超额”概念生成的 proxy 指标。
+                logz_base = torch.logsumexp(rows_logits[:, :base_vocab_size], dim=-1)
+                # 原词表概率质量占比越大，说明生成的概念越“节约”，越不超额。
+                base_mass = torch.exp(logz_base - logz)
+                count_mask = tok_t.ne(eos_t)
+                if torch.any(count_mask):
+                    quota_mass_sum = quota_mass_sum + base_mass[count_mask].sum()
+                    quota_count = quota_count + count_mask.sum().to(quota_count.dtype)
+
             # Keep only the current type's concept space for soft embedding and stats.
             probs_subset = probs[rows].index_select(1, meta.concept_ids_with_eos)  # [N_t, K_i+1]
             buffers[t]["probs"][rows, local_step] = probs_subset.float()
@@ -474,7 +529,11 @@ def plan_concepts(
             )
         )
 
-    return PlannerOutput(per_type=per_type_outputs)
+    return PlannerOutput(
+        per_type=per_type_outputs,
+        quota_mass_sum=quota_mass_sum,
+        quota_count=quota_count,
+    )
 
 def build_executor_prefix(
     model: SharedBackboneUnifiedHead,
@@ -607,4 +666,3 @@ def build_executor_blocklist(
         blocked.append(meta.eos_id)
         blocked.extend(meta.concept_ids.tolist())
     return blocked
-

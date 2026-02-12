@@ -148,11 +148,16 @@ def save_checkpoint(
         for m in metas
     ]
 
+    planner_quota_state = None
+    if hasattr(model, "planner_quota") and model.planner_quota is not None:
+        planner_quota_state = model.planner_quota.state_dict()
+
     torch.save(
         {
             "output_head": model.output_head.state_dict(),
             "type_embed": model.type_embed.state_dict(),
             "concept_metas": meta_dump,
+            "planner_quota": planner_quota_state,
             "step": step,
             "tokenizer_size": len(tokenizer),
         },
@@ -182,14 +187,9 @@ def train():
     resume_trainer_state_path = os.path.join(resume_ckpt_dir, "trainer_state.pt") if resume_ckpt_dir else ""
     resume_step = 0
     if RESUME_ENABLED:
-        if not resume_ckpt_dir:
-            raise RuntimeError("RESUME_ENABLED=True but RESUME_CHECKPOINT_DIR is empty.")
-        if not os.path.isdir(resume_ckpt_dir):
-            raise RuntimeError(f"Resume checkpoint dir not found: {resume_ckpt_dir}")
-        if not os.path.isdir(resume_backbone_dir):
-            raise RuntimeError(f"Resume backbone dir not found: {resume_backbone_dir}")
-        if not os.path.isfile(resume_heads_path):
-            raise RuntimeError(f"Resume heads file not found: {resume_heads_path}")
+        assert os.path.isdir(resume_backbone_dir), f"resume backbone dir not found: {resume_backbone_dir}"
+        assert os.path.isfile(resume_heads_path), f"resume heads file not found: {resume_heads_path}"
+        assert os.path.isfile(resume_trainer_state_path), f"resume trainer_state file not found: {resume_trainer_state_path}"
         logging.info(f"[INFO] resume enabled from: {resume_ckpt_dir}")
 
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
@@ -236,26 +236,30 @@ def train():
         num_type_embeddings=num_type_embeddings,
         frozen_output_head_prefix_rows=base_vocab_size,
     ).to(device)
+    model.planner_quota = PlannerQuotaController(
+        tau=QUOTA_TAU,
+        eta=QUOTA_ETA,
+        lambda_init=QUOTA_LAMBDA_INIT,
+        device=device,
+    )
     if RESUME_ENABLED:
         head_state = torch.load(resume_heads_path, map_location=device)
         if "output_head" in head_state:
             model.output_head.load_state_dict(head_state["output_head"])
-        elif "executor_head" in head_state:
-            model.output_head.load_state_dict(head_state["executor_head"])
-            logging.warning("[WARN] loaded legacy executor_head into unified output_head")
-        elif "planner_head" in head_state:
-            model.output_head.load_state_dict(head_state["planner_head"])
-            logging.warning("[WARN] loaded legacy planner_head into unified output_head")
         else:
             raise RuntimeError("No output head state found in checkpoint.")
         model.type_embed.load_state_dict(head_state["type_embed"])
+        if "planner_quota" in head_state and head_state["planner_quota"] is not None:
+            model.planner_quota.load_state_dict(head_state["planner_quota"], device=device)
         saved_step = head_state.get("step", 0)
         if isinstance(saved_step, int):
             resume_step = saved_step
 
     if USE_COMPILE:
         try:
-            model = torch.compile(model, mode=COMPILE_MODE, fullgraph=False)
+            compiled = torch.compile(model, mode=COMPILE_MODE, fullgraph=False)
+            compiled.planner_quota = model.planner_quota
+            model = compiled
             logging.info(f"[INFO] torch.compile enabled ({COMPILE_MODE})")
         except Exception as e:
             logging.warning(f"[WARN] torch.compile failed: {e}")
@@ -265,6 +269,7 @@ def train():
     mask_cache = ConceptMaskCache(
         metas=metas,
         vocab_size=vocab_size,
+        base_vocab_size=base_vocab_size,
         blocked_for_executor=blocked_ids,
         device=device,
     )
@@ -272,31 +277,18 @@ def train():
 
     dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
     collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
-    try:
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            num_workers=8,
-            pin_memory=True,
-            pin_memory_device="cuda",
-            collate_fn=collate_fn,
-            drop_last=True,
-            prefetch_factor=4,
-            persistent_workers=True,
-        )
-    except TypeError:
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            num_workers=8,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=True,
-            prefetch_factor=4,
-            persistent_workers=True,
-        )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        pin_memory_device="cuda", # Supported only in PyTorch 2.0+ and when CUDA is available
+        collate_fn=collate_fn,
+        drop_last=True,
+        prefetch_factor=4,
+        persistent_workers=True,
+    )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if not optim_params:
@@ -382,6 +374,7 @@ def train():
                     mask_cache=mask_cache,
                     tau=tau,
                     min_concept_steps=MIN_CONCEPT_STEPS,
+                    base_vocab_size=base_vocab_size,
                     device=device,
                 )
 
@@ -442,10 +435,13 @@ def train():
                     ignore_index=-100,
                 )
                 loss_commit, loss_unif, loss_eos, loss_len = compute_planner_losses(
-
                     planner_out=planner_out,
                     metas=metas,
                     src_lengths=src_lengths,
+                )
+                loss_quota, quota_bar = compute_planner_quota_loss(
+                    planner_out=planner_out,
+                    quota_controller=model.planner_quota,
                 )
 
                 loss = (
@@ -454,6 +450,7 @@ def train():
                     + LAMBDA_UNIF * loss_unif
                     + LAMBDA_EOS * loss_eos
                     + LAMBDA_LEN * loss_len
+                    + loss_quota
                 ).float()
 
             if not torch.isfinite(loss):
@@ -523,6 +520,9 @@ def train():
                         f"Unif {float(loss_unif.detach().cpu()):.4f} | "
                         f"EOS {float(loss_eos.detach().cpu()):.4f} | "
                         f"Len {float(loss_len.detach().cpu()):.4f} | "
+                        f"Quota {float(loss_quota.detach().cpu()):.4f} | "
+                        f"QuotaBar {float(quota_bar.detach().cpu()):.4f} | "
+                        f"QuotaLam {float(model.planner_quota.lambda_value.detach().cpu()):.4f} | "
                         f"TypeLens {','.join([f'{x:.2f}' for x in avg_lens])} | "
                         f"Tau {tau:.4f} | "
                         f"LR {scheduler.get_last_lr()[0]:.2e}"
