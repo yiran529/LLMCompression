@@ -255,6 +255,16 @@ def train():
         if isinstance(saved_step, int):
             resume_step = saved_step
 
+    # Keep base model in FP16 for memory, but move trainable params to FP32
+    # so GradScaler can unscale safely on V100.
+    fp32_casted = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.dtype != torch.float32:
+            param.data = param.data.float()
+            fp32_casted += 1
+    if fp32_casted > 0:
+        logging.info(f"[INFO] casted {fp32_casted} trainable params to fp32 for AMP stability")
+
     if USE_COMPILE:
         try:
             compiled = torch.compile(model, mode=COMPILE_MODE, fullgraph=False)

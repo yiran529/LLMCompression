@@ -196,8 +196,8 @@ class PlannerQuotaController:
         bar_m = quota_mass_sum / quota_count
         loss_quota = self.lambda_value.detach() * F.relu(bar_m - self.tau)
         with torch.no_grad():
-            self.lambda_value.add_(self.eta * (bar_m.detach() - self.tau))
-            self.lambda_value.clamp_(min=0.0)
+            new_lambda = self.lambda_value + self.eta * (bar_m.detach() - self.tau)
+            self.lambda_value = torch.clamp(new_lambda, min=0.0)
         return loss_quota, bar_m
 
 def compute_planner_quota_loss(
@@ -459,9 +459,9 @@ def plan_concepts(
             hist_sum[t] = hist_sum[t] + probs_subset[:, :-1].sum(dim=0)
 
             # Add type embedding to both soft/hard token embeddings.
-            type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1)  # [1, H]
-            soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]) + type_vec_t
-            hard_t = model.token_embed(tok_t) + type_vec_t
+            type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1).to(dtype=dtype_embed)  # [1, H]
+            soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]).to(dtype=dtype_embed) + type_vec_t
+            hard_t = model.token_embed(tok_t).to(dtype=dtype_embed) + type_vec_t
             soft_f = soft_t.float()  # [N_t, H]
             hard_f = hard_t.float()  # [N_t, H]
             # Commitment loss terms:
