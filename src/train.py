@@ -154,7 +154,8 @@ def save_checkpoint(
 
     torch.save(
         {
-            "output_head": model.output_head.state_dict(),
+            "output_head_base": model.output_head_base.state_dict(),
+            "output_head_new": model.output_head_new.state_dict() if model.output_head_new is not None else None,
             "type_embed": model.type_embed.state_dict(),
             "concept_metas": meta_dump,
             "planner_quota": planner_quota_state,
@@ -204,13 +205,28 @@ def train():
     if bos_id is None or eos_id is None:
         raise RuntimeError("Tokenizer must provide BOS/EOS ids.")
 
+    if MODEL_DTYPE == "bf16":
+        model_dtype = torch.bfloat16
+    elif MODEL_DTYPE == "fp16":
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
+
     model_kwargs = {
-        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+        "torch_dtype": model_dtype if torch.cuda.is_available() else torch.float32,
     }
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and ATTENTION_IMPL:
         # Optional acceleration when current GPU/runtime supports FA.
-        model_kwargs["attn_implementation"] = "sdpa"
-    model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
+        model_kwargs["attn_implementation"] = ATTENTION_IMPL
+    try:
+        model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
+    except Exception as e:
+        if "attn_implementation" in model_kwargs:
+            logging.warning(f"[WARN] attn_implementation={ATTENTION_IMPL} failed ({e}), falling back to sdpa")
+            model_kwargs["attn_implementation"] = "sdpa"
+            model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
+        else:
+            raise
     base_vocab_size = model_base.get_input_embeddings().num_embeddings
     # HF 默认保留旧行、只初始化新增行
     model_base.resize_token_embeddings(len(tokenizer))
@@ -244,8 +260,20 @@ def train():
     )
     if RESUME_ENABLED:
         head_state = torch.load(resume_heads_path, map_location=device)
-        if "output_head" in head_state:
-            model.output_head.load_state_dict(head_state["output_head"])
+        if "output_head_base" in head_state:
+            model.output_head_base.load_state_dict(head_state["output_head_base"])
+            if model.output_head_new is not None and head_state.get("output_head_new") is not None:
+                model.output_head_new.load_state_dict(head_state["output_head_new"])
+        elif "output_head" in head_state:
+            # Backward-compatible load from monolithic head.
+            state = head_state["output_head"]
+            weight = state.get("weight", None)
+            if weight is None:
+                raise RuntimeError("output_head state missing weight.")
+            base_rows = model.base_vocab_size
+            model.output_head_base.weight.data.copy_(weight[:base_rows])
+            if model.output_head_new is not None:
+                model.output_head_new.weight.data.copy_(weight[base_rows:])
         else:
             raise RuntimeError("No output head state found in checkpoint.")
         model.type_embed.load_state_dict(head_state["type_embed"])
@@ -255,11 +283,16 @@ def train():
         if isinstance(saved_step, int):
             resume_step = saved_step
 
-    # Keep base model in FP16 for memory, but move trainable params to FP32
-    # so GradScaler can unscale safely on V100.
+    # Optional FP32 casting for specific trainable params.
+    # On A800, keeping large heads in bf16/fp16 is usually faster.
     fp32_casted = 0
     for name, param in model.named_parameters():
-        if param.requires_grad and param.dtype != torch.float32:
+        if not param.requires_grad or param.dtype == torch.float32:
+            continue
+        if FP32_TRAINABLE == "all":
+            param.data = param.data.float()
+            fp32_casted += 1
+        elif FP32_TRAINABLE == "lora_only" and "lora" in name.lower():
             param.data = param.data.float()
             fp32_casted += 1
     if fp32_casted > 0:
@@ -303,23 +336,26 @@ def train():
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if not optim_params:
         raise RuntimeError("No trainable parameters found. Check LoRA/parameter-freeze setup.")
-    output_head_param = model.output_head.weight
-    base_params = [p for p in optim_params if id(p) != id(output_head_param)]
+    output_head_params = list(model.output_head_new.parameters()) if model.output_head_new is not None else []
+    output_head_param_ids = {id(p) for p in output_head_params}
+    base_params = [p for p in optim_params if id(p) not in output_head_param_ids]
     optimizer_groups = []
     if base_params:
         optimizer_groups.append(
             {"params": base_params, "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.01}
         )
-    optimizer_groups.append(
-        {"params": [output_head_param], "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.0}
-    )
+    if output_head_params:
+        optimizer_groups.append(
+            {"params": output_head_params, "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.0}
+        )
     optimizer = torch.optim.AdamW(optimizer_groups)
     total_steps = math.ceil(len(dataloader) / GRAD_ACCUM) * EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    use_amp = torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if torch.cuda.is_available() else None
+    use_amp = torch.cuda.is_available() and model_dtype in (torch.float16, torch.bfloat16)
+    use_scaler = torch.cuda.is_available() and model_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler) if torch.cuda.is_available() else None
     if RESUME_ENABLED and os.path.isfile(resume_trainer_state_path):
         trainer_state = torch.load(resume_trainer_state_path, map_location="cpu")
         if "optimizer" in trainer_state:
@@ -338,7 +374,7 @@ def train():
     logging.info(f"[INFO] vocab size: {vocab_size}")
     logging.info(f"[INFO] output_head frozen rows: [0, {base_vocab_size})")
     new_rows = max(0, vocab_size - base_vocab_size)
-    effective_head_params = new_rows * model.output_head.weight.shape[1]
+    effective_head_params = new_rows * model.token_embed.embedding_dim
     logging.info(
         f"[INFO] output_head trainable rows: [{base_vocab_size}, {vocab_size}) "
         f"({new_rows} rows, {effective_head_params:,} params)"
@@ -372,7 +408,7 @@ def train():
 
             tau = get_adaptive_tau(global_step, total_steps, TAU_INIT, TAU_MIN)
 
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
                 # Stage 1 (Planner): source text -> typed concept sequences.
                 (
                     planner_out,
@@ -441,7 +477,7 @@ def train():
                     use_cache=False,
                 )
                 hidden = out.last_hidden_state[:, prefix_embeds.size(1) :, :]
-                logits = model.output_head(hidden)
+                logits = model.forward_head(hidden)
                 # Executor should not produce planner-only tokens.
                 logits = logits.masked_fill(mask_cache.executor_block_bool.view(1, 1, -1), -1e4)
 

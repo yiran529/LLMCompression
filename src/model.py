@@ -102,44 +102,57 @@ class SharedBackboneUnifiedHead(nn.Module):
             backbone = backbone.model
         self.backbone = backbone
         self.token_embed = base_model.get_input_embeddings()
-        out_embed = base_model.get_output_embeddings()
         vocab_size = self.token_embed.num_embeddings
         hidden_size = self.token_embed.embedding_dim
 
-        self.output_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        out_embed = base_model.get_output_embeddings()
+        # Step 1) Resolve how many vocab rows are "base" (frozen) vs "new" (trainable).
+        if frozen_output_head_prefix_rows <= 0:
+            base_vocab_size = vocab_size
+        else:
+            base_vocab_size = frozen_output_head_prefix_rows
+        if base_vocab_size > vocab_size:
+            raise ValueError(
+                f"frozen_output_head_prefix_rows must be <= vocab_size, got {base_vocab_size} > {vocab_size}"
+            )
+        new_rows = vocab_size - base_vocab_size
+
+        # Step 2) Build split output head: frozen base rows + trainable new rows.
+        self.output_head_base = nn.Linear(hidden_size, base_vocab_size, bias=False)
+        self.output_head_new = nn.Linear(hidden_size, new_rows, bias=False) if new_rows > 0 else None
+        self.base_vocab_size = base_vocab_size
+        self.vocab_size = vocab_size
         self.type_embed = nn.Embedding(num_type_embeddings, hidden_size)
         # Keep type embeddings in the same dtype as token embeddings (e.g. fp16 on GPU).
         self.type_embed.to(dtype=self.token_embed.weight.dtype)
+        # Step 3) Keep output heads in the same dtype as token embeddings for speed.
+        head_dtype = self.token_embed.weight.dtype
+        self.output_head_base.to(dtype=head_dtype)
+        if self.output_head_new is not None:
+            self.output_head_new.to(dtype=head_dtype)
 
-        if out_embed is not None and out_embed.weight.shape == self.output_head.weight.shape:
-            self.output_head.weight.data.copy_(out_embed.weight.data)
+        # Step 4) Initialize head weights from model output embeddings when available,
+        # falling back to input embeddings for compatibility.
+        if out_embed is not None and out_embed.weight.shape[0] == vocab_size:
+            src_weight = out_embed.weight.data
         else:
-            self.output_head.weight.data.copy_(self.token_embed.weight.data)
+            src_weight = self.token_embed.weight.data
+        self.output_head_base.weight.data.copy_(src_weight[:base_vocab_size])
+        if self.output_head_new is not None:
+            self.output_head_new.weight.data.copy_(src_weight[base_vocab_size:])
 
         nn.init.zeros_(self.type_embed.weight)
-        self.register_buffer("_output_head_grad_mask", None, persistent=False)
-        if frozen_output_head_prefix_rows > 0:
-            self.freeze_output_head_prefix_rows(frozen_output_head_prefix_rows)
+        # Freeze base output head rows.
+        for p in self.output_head_base.parameters():
+            p.requires_grad = False
 
-    def freeze_output_head_prefix_rows(self, frozen_rows: int):
-        """freeze [0:frozen_rows) rows in output head and keep remaining rows trainable."""
-        vocab_size = self.output_head.weight.shape[0]
-        if frozen_rows <= 0:
-            self._output_head_grad_mask = None
-            return
-        if frozen_rows >= vocab_size:
-            raise ValueError(
-                f"frozen_rows must be in [0, vocab_size), got {frozen_rows} for vocab_size={vocab_size}"
-            )
-        mask = torch.ones((vocab_size, 1), dtype=self.output_head.weight.dtype, device=self.output_head.weight.device)
-        mask[:frozen_rows] = 0
-        self._output_head_grad_mask = mask
-        self.output_head.weight.register_hook(self._mask_output_head_grad)
-
-    def _mask_output_head_grad(self, grad: torch.Tensor) -> torch.Tensor:
-        if grad is None or self._output_head_grad_mask is None:
-            return grad
-        return grad * self._output_head_grad_mask.to(dtype=grad.dtype)
+    def forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """compute logits for full vocab with split output head."""
+        logits_base = self.output_head_base(hidden)
+        if self.output_head_new is None:
+            return logits_base
+        logits_new = self.output_head_new(hidden)
+        return torch.cat([logits_base, logits_new], dim=-1)
 
     def embed_with_type(self, token_ids: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
         """compose token embeddings with additive type embeddings."""
@@ -296,7 +309,7 @@ def plan_concepts(
         position_ids=planner_pos,
         use_cache=True,
     )
-    logits_t = model.output_head(out.last_hidden_state[:, -1, :])  # [B, V]
+    logits_t = model.forward_head(out.last_hidden_state[:, -1, :])  # [B, V]
     past_kv = out.past_key_values
 
     num_types = len(metas)
@@ -431,7 +444,7 @@ def plan_concepts(
             if not torch.any(row_mask):
                 continue
 
-            rows = row_mask.nonzero(as_tuple=False).squeeze(1)  # [N_t]
+            rows = row_mask.nonzero(as_tuple=False).squeeze(1)  # [N_t]   N_t 表示当前步、当前类型 t 的有效样本数（batch 里满足 row_mask 的行数）
             local_step = step_before[rows]  # [N_t]
             eos_t = int(meta.eos_id)
             tok_t = sampled_ids[rows]  # [N_t]
@@ -516,7 +529,7 @@ def plan_concepts(
             past_key_values=past_kv,
             use_cache=True,
         )
-        logits_t = model.output_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
+        logits_t = model.forward_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
         past_kv = out_next.past_key_values
 
     # ---------------------------------------------------------------------
