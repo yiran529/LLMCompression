@@ -36,10 +36,10 @@ def setup_logging(output_dir: str) -> str:
 
 class ParquetSentenceDataset(Dataset):
     def __init__(self, parquet_path: str, max_samples: int = None):
-        """load `sentence` column from parquet and optionally truncate."""
+        """load `text` column from parquet and optionally truncate."""
         df = pd.read_parquet(parquet_path, engine="pyarrow")
-        assert "sentence" in df.columns, "Parquet must include a 'sentence' column."
-        self.sentences = df["sentence"].astype(str).tolist()
+        assert "text" in df.columns, "Parquet must include a 'text' column."
+        self.sentences = df["text"].astype(str).tolist()
         if max_samples is not None:
             self.sentences = self.sentences[:max_samples]
         logging.info(f"[INFO] loaded samples: {len(self.sentences)}")
@@ -50,7 +50,7 @@ class ParquetSentenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         """return one raw text sample as {'sentence': str}."""
-        return {"sentence": self.sentences[idx]}
+        return {"text": self.sentences[idx]}
 
 @dataclass
 class Collator:
@@ -59,7 +59,7 @@ class Collator:
 
     def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         """tokenize a mini-batch into padded `input_ids` and `attention_mask`."""
-        texts = [ex["sentence"] for ex in batch]
+        texts = [ex["text"] for ex in batch]
         tok = self.tokenizer(
             texts,
             add_special_tokens=False,
@@ -364,7 +364,13 @@ def train():
 
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 # Stage 1 (Planner): source text -> typed concept sequences.
-                planner_out = plan_concepts(
+                (
+                    planner_out,
+                    loss_commit,
+                    loss_unif,
+                    loss_eos,
+                    loss_len,
+                ) = plan_concepts(
                     model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -393,7 +399,7 @@ def train():
                     device=device,
                 )
 
-                decoder_in, decoder_mask, labels, src_lengths = build_decoder_tensors(
+                decoder_in, decoder_mask, labels, _ = build_decoder_tensors(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     bos_id=bos_id,
@@ -434,11 +440,6 @@ def train():
                     labels.reshape(-1),
                     ignore_index=-100,
                 )
-                loss_commit, loss_unif, loss_eos, loss_len = compute_planner_losses(
-                    planner_out=planner_out,
-                    metas=metas,
-                    src_lengths=src_lengths,
-                )
                 loss_quota, quota_bar = compute_planner_quota_loss(
                     planner_out=planner_out,
                     quota_controller=model.planner_quota,
@@ -449,7 +450,6 @@ def train():
                     + LAMBDA_COMMIT * loss_commit
                     + LAMBDA_UNIF * loss_unif
                     + LAMBDA_EOS * loss_eos
-                    + LAMBDA_LEN * loss_len
                     + loss_quota
                 ).float()
 

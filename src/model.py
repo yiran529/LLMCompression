@@ -91,10 +91,16 @@ class SharedBackboneUnifiedHead(nn.Module):
     ):
         """wrap one shared backbone with one unified output head."""
         super().__init__()
-        if not hasattr(base_model, "model"):
+        backbone_owner = base_model
+        if hasattr(backbone_owner, "get_base_model"):
+            backbone_owner = backbone_owner.get_base_model()
+        if not hasattr(backbone_owner, "model"):
             raise RuntimeError("Expected a causal LM with `.model` backbone (Qwen/LLaMA-style).")
         self.base_model = base_model
-        self.backbone = base_model.model
+        backbone = backbone_owner.model
+        if hasattr(backbone, "lm_head") and hasattr(backbone, "model"):
+            backbone = backbone.model
+        self.backbone = backbone
         self.token_embed = base_model.get_input_embeddings()
         out_embed = base_model.get_output_embeddings()
         vocab_size = self.token_embed.num_embeddings
@@ -102,6 +108,8 @@ class SharedBackboneUnifiedHead(nn.Module):
 
         self.output_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.type_embed = nn.Embedding(num_type_embeddings, hidden_size)
+        # Keep type embeddings in the same dtype as token embeddings (e.g. fp16 on GPU).
+        self.type_embed.to(dtype=self.token_embed.weight.dtype)
 
         if out_embed is not None and out_embed.weight.shape == self.output_head.weight.shape:
             self.output_head.weight.data.copy_(out_embed.weight.data)
@@ -160,10 +168,6 @@ class SharedBackboneUnifiedHead(nn.Module):
 class PlannerTypeOutput:
     token_ids: torch.Tensor      # [B, S]
     valid_mask: torch.Tensor     # [B, S]
-    soft_embeds: torch.Tensor    # [B, S, H]
-    hard_embeds: torch.Tensor    # [B, S, H]
-    eos_logits: torch.Tensor     # [B, S]
-    probs_subset: torch.Tensor   # [B, S, K+1] (concept + eos)
     actual_lengths: torch.Tensor # [B]
 
 @dataclass
@@ -300,6 +304,19 @@ def plan_concepts(
     max_steps_by_type = torch.tensor([m.max_steps for m in metas], device=device, dtype=torch.long)
     eos_id_by_type = torch.tensor([m.eos_id for m in metas], device=device, dtype=torch.long)
     type_id_by_type = torch.tensor([m.type_id for m in metas], device=device, dtype=torch.long)
+    src_lengths = attention_mask.sum(dim=1).to(torch.long)
+    expected_by_type = [
+        (src_lengths.float() * m.target_ratio).long().clamp(min=1, max=m.max_steps) for m in metas
+    ]
+
+    # Online auxiliary loss accumulators (avoid storing large per-step buffers).
+    commit_sum1 = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
+    commit_sum2 = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
+    hist_sum = [
+        torch.zeros((int(m.concept_ids.numel()),), device=device, dtype=torch.float32) for m in metas
+    ]
+    eos_sum = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
+    eos_count = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
 
     # ---------------------------------------------------------------------
     # 2) Precompute type-level constants.
@@ -320,25 +337,12 @@ def plan_concepts(
     # ---------------------------------------------------------------------
     buffers: List[Dict[str, torch.Tensor]] = []
     for meta in metas:
-        kplus = int(meta.concept_ids_with_eos.numel())
         buffers.append(
             {
                 "token_ids": torch.full(
                     (bsz, meta.max_steps), meta.eos_id, device=device, dtype=torch.long
                 ),
                 "valid": torch.zeros((bsz, meta.max_steps), device=device, dtype=torch.long),
-                "soft": torch.zeros(
-                    (bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed
-                ),
-                "hard": torch.zeros(
-                    (bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed
-                ),
-                "eos_logits": torch.zeros(
-                    (bsz, meta.max_steps), device=device, dtype=torch.float32
-                ),
-                "probs": torch.zeros(
-                    (bsz, meta.max_steps, kplus), device=device, dtype=torch.float32
-                ),
             }
         )
 
@@ -436,8 +440,6 @@ def plan_concepts(
             #   buffer[type][sample_row, local_step]
             buffers[t]["token_ids"][rows, local_step] = tok_t
             buffers[t]["valid"][rows, local_step] = 1
-            buffers[t]["eos_logits"][rows, local_step] = masked_logits[rows, eos_t]
-
             # Used for computing quota loss later.
             if base_vocab_size > 0:
                 rows_logits = masked_logits[rows]
@@ -454,14 +456,27 @@ def plan_concepts(
 
             # Keep only the current type's concept space for soft embedding and stats.
             probs_subset = probs[rows].index_select(1, meta.concept_ids_with_eos)  # [N_t, K_i+1]
-            buffers[t]["probs"][rows, local_step] = probs_subset.float()
+            hist_sum[t] = hist_sum[t] + probs_subset[:, :-1].sum(dim=0)
 
             # Add type embedding to both soft/hard token embeddings.
             type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1)  # [1, H]
             soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]) + type_vec_t
             hard_t = model.token_embed(tok_t) + type_vec_t
-            buffers[t]["soft"][rows, local_step] = soft_t
-            buffers[t]["hard"][rows, local_step] = hard_t
+            soft_f = soft_t.float()  # [N_t, H]
+            hard_f = hard_t.float()  # [N_t, H]
+            # Commitment loss terms:
+            # L1 = sum ||sg(soft) - hard||^2, L2 = sum ||soft - sg(hard)||^2
+            commit_sum1[t] = commit_sum1[t] + (soft_f.detach() - hard_f).pow(2).sum()
+            commit_sum2[t] = commit_sum2[t] + (soft_f - hard_f.detach()).pow(2).sum()
+
+            expected_t = expected_by_type[t][rows]  # [N_t]
+            eos_target = (local_step >= (expected_t - 1)).float()  # [N_t]
+            eos_logit = masked_logits[rows, eos_t]  # [N_t]
+            # EOS loss: sum BCEWithLogits(eos_logit, eos_target)
+            eos_sum[t] = eos_sum[t] + F.binary_cross_entropy_with_logits(
+                eos_logit.float(), eos_target, reduction="sum"
+            )
+            eos_count[t] = eos_count[t] + eos_target.numel()
 
             soft_embed_step[rows] = soft_t
             hard_embed_step[rows] = hard_t
@@ -511,28 +526,51 @@ def plan_concepts(
     for t, meta in enumerate(metas):
         token_ids = buffers[t]["token_ids"]
         valid_mask = buffers[t]["valid"]
-        soft_embeds = buffers[t]["soft"]
-        hard_embeds = buffers[t]["hard"]
-        eos_logits = buffers[t]["eos_logits"]
-        probs_subset = buffers[t]["probs"]
         actual_lengths = valid_mask.sum(dim=1)
 
         per_type_outputs.append(
             PlannerTypeOutput(
                 token_ids=token_ids,
                 valid_mask=valid_mask,
-                soft_embeds=soft_embeds,
-                hard_embeds=hard_embeds,
-                eos_logits=eos_logits,
-                probs_subset=probs_subset,
                 actual_lengths=actual_lengths,
             )
         )
 
-    return PlannerOutput(
-        per_type=per_type_outputs,
-        quota_mass_sum=quota_mass_sum,
-        quota_count=quota_count,
+    loss_commit = torch.zeros((), device=device, dtype=torch.float32)
+    loss_unif = torch.zeros((), device=device, dtype=torch.float32)
+    loss_eos = torch.zeros((), device=device, dtype=torch.float32)
+    loss_len = torch.zeros((), device=device, dtype=torch.float32)
+    n = max(1, len(metas))
+    for t, meta in enumerate(metas):
+        denom = max(1.0, float(bsz * meta.max_steps * hidden_size))
+        loss_commit = loss_commit + commit_sum1[t] / denom + BETA_COMMIT * (commit_sum2[t] / denom)
+
+        hist = hist_sum[t]
+        hist = hist / (hist.sum() + EPS)
+        loss_unif = loss_unif + usage_kl_to_uniform(hist)
+
+        denom_eos = eos_count[t].clamp_min(1.0)
+        loss_eos = loss_eos + eos_sum[t] / denom_eos
+
+        expected = expected_by_type[t]
+        actual = per_type_outputs[t].actual_lengths
+        loss_len = loss_len + F.relu(actual.float() - expected.float()).mean()
+
+    loss_commit = loss_commit / n
+    loss_unif = loss_unif / n
+    loss_eos = loss_eos / n
+    loss_len = loss_len / n
+
+    return (
+        PlannerOutput(
+            per_type=per_type_outputs,
+            quota_mass_sum=quota_mass_sum,
+            quota_count=quota_count,
+        ),
+        loss_commit,
+        loss_unif,
+        loss_eos,
+        loss_len,
     )
 
 def build_executor_prefix(
@@ -559,12 +597,20 @@ def build_executor_prefix(
     pos_chunks.append(torch.zeros((bsz, 1), device=device, dtype=torch.long))
 
     for meta, type_out in zip(metas, planner_out.per_type):
-        token_chunks.append(type_out.token_ids)
-        type_chunks.append(torch.full_like(type_out.token_ids, meta.type_id))
-        mask_chunks.append(type_out.valid_mask)
+        # Trim each type block to the maximum valid length in the batch to save memory.
+        type_lens = type_out.valid_mask.sum(dim=1).to(torch.long)
+        max_len = int(type_lens.max().item())
+        if max_len == 0:
+            continue
+        tok = type_out.token_ids[:, :max_len]
+        msk = type_out.valid_mask[:, :max_len]
+
+        token_chunks.append(tok)
+        type_chunks.append(torch.full_like(tok, meta.type_id))
+        mask_chunks.append(msk)
         # Critical rule: position indices restart from 1 for each type block.
         pos_chunks.append(
-            torch.arange(1, meta.max_steps + 1, device=device, dtype=torch.long)
+            torch.arange(1, max_len + 1, device=device, dtype=torch.long)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
@@ -610,51 +656,6 @@ def build_decoder_tensors(
 
 # Backward-compatible alias for older imports.
 SharedBackboneTwoHeads = SharedBackboneUnifiedHead
-
-def compute_planner_losses(
-    planner_out: PlannerOutput,
-    metas: List[ConceptTypeMeta],
-    src_lengths: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """aggregate planner-side regularizers for concept quality and budget control."""
-    loss_commit = torch.zeros((), device=src_lengths.device, dtype=torch.float32)
-    loss_unif = torch.zeros((), device=src_lengths.device, dtype=torch.float32)
-    loss_eos = torch.zeros((), device=src_lengths.device, dtype=torch.float32)
-    loss_len = torch.zeros((), device=src_lengths.device, dtype=torch.float32)
-
-    for meta, type_out in zip(metas, planner_out.per_type):
-        # 1) Commitment: keep hard concept picks close to soft distributions.
-        valid = type_out.valid_mask.unsqueeze(-1).float()
-        soft_v = type_out.soft_embeds * valid
-        hard_v = type_out.hard_embeds * valid
-        loss_commit = loss_commit + commitment_loss(soft_v, hard_v, beta=BETA_COMMIT)
-
-        # 2) Usage uniformity: avoid collapsing to a small subset of concept IDs.
-        concept_probs = type_out.probs_subset[:, :, :-1]  # remove EOS column
-        weighted = concept_probs * type_out.valid_mask.unsqueeze(-1).float()
-        hist = weighted.sum(dim=(0, 1))
-        hist = hist / (hist.sum() + EPS)
-        loss_unif = loss_unif + usage_kl_to_uniform(hist)
-
-        # 3) EOS target: encourage stopping near a ratio-based expected concept length.
-        expected = (src_lengths.float() * meta.target_ratio).long().clamp(
-            min=1, max=meta.max_steps
-        )
-        eos_targets = torch.zeros_like(type_out.eos_logits)
-        for b in range(eos_targets.size(0)):
-            k = int(expected[b].item())
-            eos_targets[b, k - 1 :] = 1.0
-        eos_bce = F.binary_cross_entropy_with_logits(
-            type_out.eos_logits.float(), eos_targets.float(), reduction="none"
-        )
-        valid_float = type_out.valid_mask.float()
-        loss_eos = loss_eos + (eos_bce * valid_float).sum() / (valid_float.sum() + 1e-6)
-
-        # 4) Length budget: penalize sequences longer than expected.
-        loss_len = loss_len + F.relu(type_out.actual_lengths.float() - expected.float()).mean()
-
-    n = max(1, len(metas))
-    return loss_commit / n, loss_unif / n, loss_eos / n, loss_len / n
 
 def build_executor_blocklist(
     metas: List[ConceptTypeMeta],

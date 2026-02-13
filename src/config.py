@@ -10,16 +10,16 @@ import torch.backends.cudnn as cudnn
 USE_COMPILE = False
 COMPILE_MODE = "max-autotune"
 
-BASE_DIR = "/root/lm_merge/qwen3_0.6b_z4096"
-PARQUET_PATH = "/root/data/wiki_en_sentences_flat.parquet"
-OUTPUT_DIR = "/root/lm_merge/train_runs/concept_first_v1"
+BASE_DIR = "./qwen3-0.6b"
+PARQUET_PATH = "./data/wikipedia_512.parquet"
+OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 48
+BATCH_SIZE = 1
 GRAD_ACCUM = 4
 EPOCHS = 3
 LR = 3e-4
 WARMUP_RATIO = 0.1
-MAX_INPUT_TOKENS = 96
+MAX_INPUT_TOKENS = 512
 SEED = 42
 SAVE_STEPS = 1000
 LOG_STEPS = 100
@@ -71,9 +71,9 @@ class ConceptTypeConfig:
 
 
 CONCEPT_TYPE_CONFIGS = [
-    ConceptTypeConfig(name="bottom", size=2048, max_steps=1000, target_ratio=0.45),
-    ConceptTypeConfig(name="mid", size=256, max_steps=500, target_ratio=0.05),
-    ConceptTypeConfig(name="top", size=32, max_steps=500, target_ratio=0.01),
+    ConceptTypeConfig(name="bottom", size=2048, max_steps=130, target_ratio=0.23),
+    ConceptTypeConfig(name="mid", size=256, max_steps=20, target_ratio=0.02),
+    ConceptTypeConfig(name="top", size=32, max_steps=8, target_ratio=0.01),
 ]
 
 
