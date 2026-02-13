@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -182,6 +182,7 @@ class PlannerTypeOutput:
     token_ids: torch.Tensor      # [B, S]
     valid_mask: torch.Tensor     # [B, S]
     actual_lengths: torch.Tensor # [B]
+    st_embeds: Optional[torch.Tensor] = None  # [B, S, H], straight-through concept embeddings
 
 @dataclass
 class PlannerOutput:
@@ -356,6 +357,9 @@ def plan_concepts(
                     (bsz, meta.max_steps), meta.eos_id, device=device, dtype=torch.long
                 ),
                 "valid": torch.zeros((bsz, meta.max_steps), device=device, dtype=torch.long),
+                "st_embeds": torch.zeros(
+                    (bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed
+                ),
             }
         )
 
@@ -475,6 +479,7 @@ def plan_concepts(
             type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1).to(dtype=dtype_embed)  # [1, H]
             soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]).to(dtype=dtype_embed) + type_vec_t
             hard_t = model.token_embed(tok_t).to(dtype=dtype_embed) + type_vec_t
+            st_t = hard_t + (soft_t - soft_t.detach())
             soft_f = soft_t.float()  # [N_t, H]
             hard_f = hard_t.float()  # [N_t, H]
             # Commitment loss terms:
@@ -493,6 +498,8 @@ def plan_concepts(
 
             soft_embed_step[rows] = soft_t
             hard_embed_step[rows] = hard_t
+            # Keep a differentiable write path so stage-2 loss can flow back to planner ST embeddings.
+            buffers[t]["st_embeds"] = buffers[t]["st_embeds"].index_put((rows, local_step), st_t)
             step_pos[rows, 0] = local_step + 1  # per-type position reset rule.
 
             # Async state transition per sample:
@@ -546,6 +553,7 @@ def plan_concepts(
                 token_ids=token_ids,
                 valid_mask=valid_mask,
                 actual_lengths=actual_lengths,
+                st_embeds=buffers[t]["st_embeds"],
             )
         )
 
@@ -594,20 +602,23 @@ def build_executor_prefix(
     bos_id: int,
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """build concept-only executor prefix with type ids, mask, and reset positions."""
+    """build concept-only executor prefix with type ids, mask, reset positions, and embeddings."""
     bsz = planner_out.per_type[0].token_ids.size(0)
 
     token_chunks: List[torch.Tensor] = []
     type_chunks: List[torch.Tensor] = []
     mask_chunks: List[torch.Tensor] = []
     pos_chunks: List[torch.Tensor] = []
+    embed_chunks: List[torch.Tensor] = []
 
     # Executor starts from BOS and does not see source text tokens.
     bos = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
+    bos_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
     token_chunks.append(bos)
-    type_chunks.append(torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long))
+    type_chunks.append(bos_type)
     mask_chunks.append(torch.ones((bsz, 1), device=device, dtype=torch.long))
     pos_chunks.append(torch.zeros((bsz, 1), device=device, dtype=torch.long))
+    embed_chunks.append(model.embed_with_type(bos, bos_type))
 
     for meta, type_out in zip(metas, planner_out.per_type):
         # Trim each type block to the maximum valid length in the batch to save memory.
@@ -617,10 +628,17 @@ def build_executor_prefix(
             continue
         tok = type_out.token_ids[:, :max_len]
         msk = type_out.valid_mask[:, :max_len]
+        typ = torch.full_like(tok, meta.type_id)
 
         token_chunks.append(tok)
-        type_chunks.append(torch.full_like(tok, meta.type_id))
+        type_chunks.append(typ)
         mask_chunks.append(msk)
+        if type_out.st_embeds is not None:
+            st = type_out.st_embeds[:, :max_len, :]
+            st = st * msk.unsqueeze(-1).to(st.dtype)
+            embed_chunks.append(st)
+        else:
+            embed_chunks.append(model.embed_with_type(tok, typ))
         # Critical rule: position indices restart from 1 for each type block.
         pos_chunks.append(
             torch.arange(1, max_len + 1, device=device, dtype=torch.long)
@@ -632,7 +650,7 @@ def build_executor_prefix(
     prefix_type_ids = torch.cat(type_chunks, dim=1)
     prefix_mask = torch.cat(mask_chunks, dim=1)
     prefix_pos = torch.cat(pos_chunks, dim=1)
-    prefix_embeds = model.embed_with_type(prefix_token_ids, prefix_type_ids)
+    prefix_embeds = torch.cat(embed_chunks, dim=1)
     return prefix_embeds, prefix_mask, prefix_pos, prefix_token_ids, prefix_type_ids
 
 def build_decoder_tensors(
