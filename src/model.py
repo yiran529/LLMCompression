@@ -603,14 +603,18 @@ def build_executor_prefix(
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """build concept-only executor prefix with type ids, mask, reset positions, and embeddings."""
+    # Batch size B.
     bsz = planner_out.per_type[0].token_ids.size(0)
 
+    # Each list stores one prefix block; blocks are concatenated at the end.
+    # token/type/mask/pos block shape: [B, L_i], embed block shape: [B, L_i, H].
     token_chunks: List[torch.Tensor] = []
     type_chunks: List[torch.Tensor] = []
     mask_chunks: List[torch.Tensor] = []
     pos_chunks: List[torch.Tensor] = []
     embed_chunks: List[torch.Tensor] = []
 
+    # Block 0: BOS-only prefix.
     # Executor starts from BOS and does not see source text tokens.
     bos = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
     bos_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
@@ -620,12 +624,15 @@ def build_executor_prefix(
     pos_chunks.append(torch.zeros((bsz, 1), device=device, dtype=torch.long))
     embed_chunks.append(model.embed_with_type(bos, bos_type))
 
+    # Blocks 1..T: append each concept-type segment from planner output.
     for meta, type_out in zip(metas, planner_out.per_type):
         # Trim each type block to the maximum valid length in the batch to save memory.
+        # type_lens: [B], max_len: scalar.
         type_lens = type_out.valid_mask.sum(dim=1).to(torch.long)
         max_len = int(type_lens.max().item())
         if max_len == 0:
             continue
+        # tok/msk/typ: [B, max_len].
         tok = type_out.token_ids[:, :max_len]
         msk = type_out.valid_mask[:, :max_len]
         typ = torch.full_like(tok, meta.type_id)
@@ -634,18 +641,24 @@ def build_executor_prefix(
         type_chunks.append(typ)
         mask_chunks.append(msk)
         if type_out.st_embeds is not None:
+            # st: [B, max_len, H], zero out padded positions with msk.
             st = type_out.st_embeds[:, :max_len, :]
             st = st * msk.unsqueeze(-1).to(st.dtype)
             embed_chunks.append(st)
         else:
+            # Fallback to standard token+type embedding if ST embeds are absent.
             embed_chunks.append(model.embed_with_type(tok, typ))
         # Critical rule: position indices restart from 1 for each type block.
+        # pos block shape: [B, max_len].
         pos_chunks.append(
             torch.arange(1, max_len + 1, device=device, dtype=torch.long)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
 
+    # Concatenate all prefix blocks into final executor inputs.
+    # prefix_token_ids/prefix_type_ids/prefix_mask/prefix_pos: [B, Lp]
+    # prefix_embeds: [B, Lp, H]
     prefix_token_ids = torch.cat(token_chunks, dim=1)
     prefix_type_ids = torch.cat(type_chunks, dim=1)
     prefix_mask = torch.cat(mask_chunks, dim=1)
@@ -698,3 +711,145 @@ def build_executor_blocklist(
         blocked.append(meta.eos_id)
         blocked.extend(meta.concept_ids.tolist())
     return blocked
+
+####################################################################
+#                                                                  #
+# Inference utilities: planner->prefix->executor greedy decoding.  #
+#                                                                  #
+####################################################################
+
+@dataclass
+class ExecutorInferenceOutput:
+    generated_ids: torch.Tensor
+    generated_mask: torch.Tensor
+    lengths: torch.Tensor
+    planner_out: PlannerOutput
+    prefix_token_ids: torch.Tensor
+    prefix_type_ids: torch.Tensor
+    prefix_mask: torch.Tensor
+    prefix_pos: torch.Tensor
+
+
+@torch.no_grad()
+def run_executor_inference(
+    model: SharedBackboneUnifiedHead,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    plan_token_id: int,
+    bos_id: int,
+    eos_id: int,
+    metas: List[ConceptTypeMeta],
+    mask_cache: ConceptMaskCache,
+    device: str,
+    max_new_tokens: int = 64,
+    planner_tau: float = 0.2,
+    min_concept_steps: int = 1,
+) -> ExecutorInferenceOutput:
+    """run planner->prefix->executor greedy decoding for inference."""
+    bsz = input_ids.size(0)
+    max_new_tokens = max(0, int(max_new_tokens))
+
+    was_training = model.training
+    model.eval()
+    try:
+        planner_out, *_ = plan_concepts(
+            model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            plan_token_id=plan_token_id,
+            bos_id=bos_id,
+            metas=metas,
+            mask_cache=mask_cache,
+            tau=planner_tau,
+            min_concept_steps=min_concept_steps,
+            base_vocab_size=model.base_vocab_size,
+            device=device,
+        )
+        (
+            prefix_embeds,
+            prefix_mask,
+            prefix_pos,
+            prefix_token_ids,
+            prefix_type_ids,
+        ) = build_executor_prefix(
+            model,
+            planner_out=planner_out,
+            metas=metas,
+            bos_id=bos_id,
+            device=device,
+        )
+
+        assert max_new_tokens > 0, "max_new_tokens must be positive for inference decoding."
+        generated_ids = torch.full((bsz, max_new_tokens), eos_id, device=device, dtype=torch.long)
+        generated_mask = torch.zeros((bsz, max_new_tokens), device=device, dtype=torch.long)
+
+        # Prime executor cache with [prefix, BOS] so first logits predict token_1.
+        bos = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
+        bos_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
+        bos_embed = model.embed_with_type(bos, bos_type)
+        bos_mask = torch.ones((bsz, 1), device=device, dtype=torch.long)
+
+        prefix_true_len = prefix_mask.sum(dim=1).to(torch.long)  # [B]
+        bos_pos = prefix_true_len.unsqueeze(1)                    # [B, 1]
+
+        prime_embeds = torch.cat([prefix_embeds, bos_embed], dim=1)
+        prime_mask = torch.cat([prefix_mask, bos_mask], dim=1)
+        prime_pos = torch.cat([prefix_pos, bos_pos], dim=1)
+
+        out = model.forward_backbone(
+            inputs_embeds=prime_embeds,
+            attention_mask=prime_mask,
+            position_ids=prime_pos,
+            use_cache=True,
+        )
+        logits_t = model.forward_head(out.last_hidden_state[:, -1, :]).float()  # [B, V]
+        logits_t = logits_t.masked_fill(mask_cache.executor_block_bool.view(1, -1), -1e4)
+        past_kv = out.past_key_values
+
+        ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
+        finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
+        fed_len = 1  # already fed BOS
+        eos_fill = torch.full((bsz,), eos_id, device=device, dtype=torch.long)
+
+        for step in range(max_new_tokens):
+            next_ids = logits_t.argmax(dim=-1)        # [B]
+            next_ids = torch.where(finished, eos_fill, next_ids)
+
+            generated_ids[:, step] = next_ids
+            generated_mask[:, step] = (~finished).to(torch.long)
+            finished = finished | next_ids.eq(eos_id)
+            if torch.all(finished):
+                break
+
+            next_tok = next_ids.unsqueeze(1)  # [B, 1]
+            next_type = torch.full_like(next_tok, TYPE_ID_TEXT)
+            next_embed = model.embed_with_type(next_tok, next_type)
+            step_pos = (prefix_true_len + fed_len).unsqueeze(1)  # [B, 1]
+
+            out = model.forward_backbone(
+                inputs_embeds=next_embed,
+                attention_mask=ones_step,
+                position_ids=step_pos,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            logits_t = model.forward_head(out.last_hidden_state[:, -1, :]).float()
+            logits_t = logits_t.masked_fill(mask_cache.executor_block_bool.view(1, -1), -1e4)
+            past_kv = out.past_key_values
+            fed_len += 1
+
+        lengths = generated_mask.sum(dim=1)
+        return ExecutorInferenceOutput(
+            generated_ids=generated_ids,
+            generated_mask=generated_mask,
+            lengths=lengths,
+            planner_out=planner_out,
+            prefix_token_ids=prefix_token_ids,
+            prefix_type_ids=prefix_type_ids,
+            prefix_mask=prefix_mask,
+            prefix_pos=prefix_pos,
+        )
+    finally:
+        if was_training:
+            model.train()
