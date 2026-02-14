@@ -1,0 +1,1 @@
+1. 外显化的 Universal Transformer;但区别是：UT 在连续空间反复打磨;你在离散空间先做规划

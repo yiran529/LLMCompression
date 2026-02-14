@@ -22,12 +22,12 @@ BASE_DIR = "./qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 12
+BATCH_SIZE = 32
 GRAD_ACCUM = 8
 EPOCHS = 3
 LR = 5e-4
 WARMUP_RATIO = 0.1
-MAX_INPUT_TOKENS = 128
+MAX_INPUT_TOKENS = 64
 SEED = 42
 SAVE_STEPS = 200
 LOG_STEPS = 5
@@ -79,9 +79,9 @@ class ConceptTypeConfig:
 
 
 CONCEPT_TYPE_CONFIGS = [
-    ConceptTypeConfig(name="bottom", size=2048, max_steps=64, target_ratio=0.23),
-    ConceptTypeConfig(name="mid", size=256, max_steps=20, target_ratio=0.04),
-    ConceptTypeConfig(name="top", size=32, max_steps=8, target_ratio=0.02),
+    ConceptTypeConfig(name="bottom", size=2048, max_steps=20, target_ratio=0.23),
+    ConceptTypeConfig(name="mid", size=256, max_steps=8, target_ratio=0.04),
+    ConceptTypeConfig(name="top", size=32, max_steps=4, target_ratio=0.02),
 ]
 
 
