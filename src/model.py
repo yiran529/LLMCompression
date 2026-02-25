@@ -101,9 +101,10 @@ class SharedBackboneUnifiedHead(nn.Module):
         if hasattr(backbone, "lm_head") and hasattr(backbone, "model"):
             backbone = backbone.model
         self.backbone = backbone
-        self.token_embed = base_model.get_input_embeddings()
-        vocab_size = self.token_embed.num_embeddings
-        hidden_size = self.token_embed.embedding_dim
+        input_embed = base_model.get_input_embeddings()
+        vocab_size = input_embed.num_embeddings
+        hidden_size = input_embed.embedding_dim
+        self.hidden_size = hidden_size
 
         out_embed = base_model.get_output_embeddings()
         # Step 1) Resolve how many vocab rows are "base" (frozen) vs "new" (trainable).
@@ -117,26 +118,41 @@ class SharedBackboneUnifiedHead(nn.Module):
             )
         new_rows = vocab_size - base_vocab_size
 
-        # Step 2) Build split output head: frozen base rows + trainable new rows.
+        # Step 2) Build split token embeddings: frozen base rows + trainable new rows.
+        self.token_embed_base = nn.Embedding(base_vocab_size, hidden_size)
+        self.token_embed_new = nn.Embedding(new_rows, hidden_size) if new_rows > 0 else None
+        token_dtype = input_embed.weight.dtype
+        self.token_embed_base.to(dtype=token_dtype)
+        if self.token_embed_new is not None:
+            self.token_embed_new.to(dtype=token_dtype)
+
+        # Step 3) Initialize token embeddings from model input embeddings.
+        src_input_weight = input_embed.weight.data
+        self.token_embed_base.weight.data.copy_(src_input_weight[:base_vocab_size])
+        self.token_embed_base.weight.requires_grad = False
+        if self.token_embed_new is not None:
+            self.token_embed_new.weight.data.copy_(src_input_weight[base_vocab_size:])
+
+        # Step 4) Build split output head: frozen base rows + trainable new rows.
         self.output_head_base = nn.Linear(hidden_size, base_vocab_size, bias=False)
         self.output_head_new = nn.Linear(hidden_size, new_rows, bias=False) if new_rows > 0 else None
         self.base_vocab_size = base_vocab_size
         self.vocab_size = vocab_size
         self.type_embed = nn.Embedding(num_type_embeddings, hidden_size)
         # Keep type embeddings in the same dtype as token embeddings (e.g. fp16 on GPU).
-        self.type_embed.to(dtype=self.token_embed.weight.dtype)
-        # Step 3) Keep output heads in the same dtype as token embeddings for speed.
-        head_dtype = self.token_embed.weight.dtype
+        self.type_embed.to(dtype=token_dtype)
+        # Step 5) Keep output heads in the same dtype as token embeddings for speed.
+        head_dtype = token_dtype
         self.output_head_base.to(dtype=head_dtype)
         if self.output_head_new is not None:
             self.output_head_new.to(dtype=head_dtype)
 
-        # Step 4) Initialize head weights from model output embeddings when available,
+        # Step 6) Initialize head weights from model output embeddings when available,
         # falling back to input embeddings for compatibility.
         if out_embed is not None and out_embed.weight.shape[0] == vocab_size:
             src_weight = out_embed.weight.data
         else:
-            src_weight = self.token_embed.weight.data
+            src_weight = src_input_weight
         self.output_head_base.weight.data.copy_(src_weight[:base_vocab_size])
         if self.output_head_new is not None:
             self.output_head_new.weight.data.copy_(src_weight[base_vocab_size:])
@@ -145,6 +161,29 @@ class SharedBackboneUnifiedHead(nn.Module):
         # Freeze base output head rows.
         for p in self.output_head_base.parameters():
             p.requires_grad = False
+
+    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """embed token ids with frozen base rows + trainable new rows."""
+        if self.token_embed_new is None:
+            return self.token_embed_base(token_ids)
+        flat_ids = token_ids.reshape(-1)
+        out = torch.empty(
+            (flat_ids.numel(), self.hidden_size),
+            device=flat_ids.device,
+            dtype=self.token_embed_base.weight.dtype,
+        )
+        is_base = flat_ids < self.base_vocab_size
+        if torch.any(is_base):
+            out[is_base] = self.token_embed_base(flat_ids[is_base])
+        if torch.any(~is_base):
+            out[~is_base] = self.token_embed_new(flat_ids[~is_base] - self.base_vocab_size)
+        return out.view(*token_ids.shape, self.hidden_size)
+
+    def get_new_token_embed_weight(self) -> torch.Tensor:
+        """return trainable new-token embedding rows (possibly empty)."""
+        if self.token_embed_new is None:
+            return self.token_embed_base.weight.new_empty((0, self.hidden_size))
+        return self.token_embed_new.weight
 
     def forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
         """compute logits for full vocab with split output head."""
@@ -156,7 +195,7 @@ class SharedBackboneUnifiedHead(nn.Module):
 
     def embed_with_type(self, token_ids: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
         """compose token embeddings with additive type embeddings."""
-        return self.token_embed(token_ids) + self.type_embed(type_ids)
+        return self.embed_tokens(token_ids) + self.type_embed(type_ids)
 
     def forward_backbone(
         self,
@@ -276,8 +315,8 @@ def plan_concepts(
 ) -> PlannerOutput:
     """generate one variable-length concept sequence per type from source input."""
     bsz, _ = input_ids.shape
-    hidden_size = model.token_embed.embedding_dim
-    dtype_embed = model.token_embed.weight.dtype
+    hidden_size = model.hidden_size
+    dtype_embed = model.token_embed_base.weight.dtype
 
     # ---------------------------------------------------------------------
     # 1) Build planner prompt.
@@ -342,7 +381,7 @@ def plan_concepts(
     )  # [T, V]
     # concept_tables[t] holds token embeddings for [C_t..., EOS_t].
     concept_tables = [
-        model.token_embed.weight.index_select(0, m.concept_ids_with_eos) for m in metas
+        model.embed_tokens(m.concept_ids_with_eos) for m in metas
     ]  # list of [K_i+1, H]
 
     # ---------------------------------------------------------------------
@@ -478,7 +517,7 @@ def plan_concepts(
             # Add type embedding to both soft/hard token embeddings.
             type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1).to(dtype=dtype_embed)  # [1, H]
             soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]).to(dtype=dtype_embed) + type_vec_t
-            hard_t = model.token_embed(tok_t).to(dtype=dtype_embed) + type_vec_t
+            hard_t = model.embed_tokens(tok_t).to(dtype=dtype_embed) + type_vec_t
             st_t = hard_t + (soft_t - soft_t.detach())
             soft_f = soft_t.float()  # [N_t, H]
             hard_f = hard_t.float()  # [N_t, H]
@@ -523,7 +562,7 @@ def plan_concepts(
                 device=device,
                 dtype=torch.long,
             )
-            hard_embed_step[~active] = model.token_embed(dummy_ids)
+            hard_embed_step[~active] = model.embed_tokens(dummy_ids)
             soft_embed_step[~active] = hard_embed_step[~active]
             step_pos[~active, 0] = 0
 

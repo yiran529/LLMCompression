@@ -7,8 +7,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import *
-from model import *
+from src.config import *
+from src.model import *
 
 
 @dataclass
@@ -76,7 +76,7 @@ def _load_backbone_model(
     if os.path.isfile(adapter_config_path):
         assert base_dir, "Checkpoint backbone is LoRA adapter, but INFER_BASE_DIR is empty."
         model_base = AutoModelForCausalLM.from_pretrained(base_dir, **model_kwargs).to(device)
-        model_base.resize_token_embeddings(tokenizer_size)
+        model_base.resize_token_embeddings(tokenizer_size, mean_resizing=False)
         return PeftModel.from_pretrained(model_base, backbone_dir, is_trainable=False).to(device)
 
     return AutoModelForCausalLM.from_pretrained(backbone_dir, **model_kwargs).to(device)
@@ -144,6 +144,19 @@ def load_runtime() -> InferenceRuntime:
     if model.output_head_new is not None:
         model.output_head_new.load_state_dict(head_state["output_head_new"])
     model.type_embed.load_state_dict(head_state["type_embed"])
+    token_embed_new = head_state.get("token_embed_new")
+    if token_embed_new is not None and token_embed_new.numel() > 0:
+        expected_new_rows = model.vocab_size - model.base_vocab_size
+        assert token_embed_new.shape[0] == expected_new_rows, (
+            f"token_embed_new rows mismatch: ckpt={token_embed_new.shape[0]} vs model={expected_new_rows}"
+        )
+        assert model.token_embed_new is not None, "Checkpoint has token_embed_new but model has no new-token embedding rows."
+        model.token_embed_new.weight.data.copy_(token_embed_new.to(
+            device=device,
+            dtype=model.token_embed_new.weight.dtype,
+        ))
+    else:
+        print("[WARN] `token_embed_new` not found in two_stage_heads.pt; new token embeddings may be random.")
 
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
     assert plan_token_id is not None and plan_token_id >= 0, "Tokenizer does not contain `<PLAN>` token."
@@ -153,7 +166,7 @@ def load_runtime() -> InferenceRuntime:
     assert bos_id is not None and eos_id is not None, "Tokenizer must have BOS/EOS token id."
 
     blocked_ids = build_executor_blocklist(metas, plan_token_id=plan_token_id)
-    vocab_size = model.token_embed.num_embeddings
+    vocab_size = model.vocab_size
     mask_cache = ConceptMaskCache(
         metas=metas,
         vocab_size=vocab_size,

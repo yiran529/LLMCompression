@@ -17,182 +17,37 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from src.config import *
 from src.model import *
-
-def setup_logging(output_dir: str) -> str:
-    """configure file+stdout logging and return the log file path."""
-    log_dir = os.path.join(output_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"training_log_{timestamp}.txt")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return log_file
-
-class ParquetSentenceDataset(Dataset):
-    def __init__(self, parquet_path: str, max_samples: int = None):
-        """load `text` column from parquet and optionally truncate."""
-        df = pd.read_parquet(parquet_path, engine="pyarrow")
-        assert "text" in df.columns, "Parquet must include a 'text' column."
-        self.sentences = df["text"].astype(str).tolist()
-        if max_samples is not None:
-            self.sentences = self.sentences[:max_samples]
-        logging.info(f"[INFO] loaded samples: {len(self.sentences)}")
-
-    def __len__(self) -> int:
-        """return number of usable training examples."""
-        return len(self.sentences)
-
-    def __getitem__(self, idx: int) -> Dict[str, str]:
-        """return one raw text sample as {'sentence': str}."""
-        return {"text": self.sentences[idx]}
-
-@dataclass
-class Collator:
-    tokenizer: AutoTokenizer
-    max_len: int
-
-    def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
-        """tokenize a mini-batch into padded `input_ids` and `attention_mask`."""
-        texts = [ex["text"] for ex in batch]
-        tok = self.tokenizer(
-            texts,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors="pt",
-            padding=True,
-        )
-        return {
-            "input_ids": tok["input_ids"],
-            "attention_mask": tok["attention_mask"],
-        }
-
-def get_adaptive_tau(global_step: int, total_steps: int, tau_init: float, tau_min: float) -> float:
-    """anneal Gumbel-Softmax temperature from `tau_init` to `tau_min`."""
-    ratio = global_step / max(1, total_steps)
-    if ratio < 0.6:
-        local = ratio / 0.6
-        return tau_init - (tau_init - 0.4) * local
-    local = (ratio - 0.6) / 0.4
-    return 0.4 - (0.4 - tau_min) * local
-
-class CUDAPrefetcher:
-    def __init__(self, loader: DataLoader, device: str = "cuda"):
-        """overlap host->device transfer with compute using a side CUDA stream."""
-        self.loader_iter = iter(loader)
-        self.device = device
-        self.stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
-        self.next_batch = None
-        self._preload()
-
-    def _preload(self):
-        """asynchronously stage the next batch to target device."""
-        try:
-            batch = next(self.loader_iter)
-        except StopIteration:
-            self.next_batch = None
-            return
-        if self.stream is None:
-            self.next_batch = batch
-            return
-        with torch.cuda.stream(self.stream):
-            self.next_batch = {
-                "input_ids": batch["input_ids"].to(self.device, non_blocking=True),
-                "attention_mask": batch["attention_mask"].to(self.device, non_blocking=True),
-            }
-
-    def next(self):
-        """return current prepared batch and trigger preload of the following batch."""
-        if self.next_batch is None:
-            return None
-        if self.stream is not None:
-            torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
-        self._preload()
-        return batch
-
-def save_checkpoint(
-    model: SharedBackboneUnifiedHead,
-    tokenizer: AutoTokenizer,
-    metas: List[ConceptTypeMeta],
-    step: int,
-    output_dir: str,
-    optimizer=None,
-    scheduler=None,
-    scaler=None,
-):
-    """persist backbone/tokenizer and lightweight planner metadata."""
-    save_name = f"checkpoint-{step}" if isinstance(step, int) else str(step)
-    save_dir = os.path.join(output_dir, save_name)
-    backbone_dir = os.path.join(save_dir, "backbone")
-    os.makedirs(backbone_dir, exist_ok=True)
-
-    model.base_model.save_pretrained(backbone_dir)
-    tokenizer.save_pretrained(backbone_dir)
-
-    meta_dump = [
-        {
-            "name": m.name,
-            "type_id": m.type_id,
-            "eos_id": m.eos_id,
-            "concept_ids": m.concept_ids.tolist(),
-            "max_steps": m.max_steps,
-            "target_ratio": m.target_ratio,
-        }
-        for m in metas
-    ]
-
-    planner_quota_state = None
-    if hasattr(model, "planner_quota") and model.planner_quota is not None:
-        planner_quota_state = model.planner_quota.state_dict()
-
-    torch.save(
-        {
-            "output_head_base": model.output_head_base.state_dict(),
-            "output_head_new": model.output_head_new.state_dict() if model.output_head_new is not None else None,
-            "type_embed": model.type_embed.state_dict(),
-            "concept_metas": meta_dump,
-            "planner_quota": planner_quota_state,
-            "step": step,
-            "tokenizer_size": len(tokenizer),
-        },
-        os.path.join(save_dir, "two_stage_heads.pt"),
-    )
-    if optimizer is not None and scheduler is not None and isinstance(step, int):
-        trainer_state = {
-            "step": step,
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-        }
-        if scaler is not None and scaler.is_enabled():
-            trainer_state["scaler"] = scaler.state_dict()
-        torch.save(trainer_state, os.path.join(save_dir, "trainer_state.pt"))
-    logging.info(f"[SAVE] checkpoint saved to: {save_dir}")
+from src.utils.trainer_utils import *
 
 def train():
     """run two-stage concept-first training with a shared backbone and one output head."""
+    # =========================
+    # 0) Logging and basic runtime info
+    # =========================
     log_file = setup_logging(OUTPUT_DIR)
     logging.info(f"[INFO] log file: {log_file}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"[INFO] device: {device}")
+
+    # =========================
+    # 1) Resume checkpoint settings
+    # =========================
     resume_ckpt_dir = RESUME_CHECKPOINT_DIR.strip()
     resume_backbone_dir = os.path.join(resume_ckpt_dir, "backbone") if resume_ckpt_dir else ""
     resume_heads_path = os.path.join(resume_ckpt_dir, "two_stage_heads.pt") if resume_ckpt_dir else ""
     resume_trainer_state_path = os.path.join(resume_ckpt_dir, "trainer_state.pt") if resume_ckpt_dir else ""
     resume_step = 0
     if RESUME_ENABLED:
+        assert resume_ckpt_dir, "RESUME_ENABLED=True but RESUME_CHECKPOINT_DIR is empty."
         assert os.path.isdir(resume_backbone_dir), f"resume backbone dir not found: {resume_backbone_dir}"
         assert os.path.isfile(resume_heads_path), f"resume heads file not found: {resume_heads_path}"
         assert os.path.isfile(resume_trainer_state_path), f"resume trainer_state file not found: {resume_trainer_state_path}"
         logging.info(f"[INFO] resume enabled from: {resume_ckpt_dir}")
 
+    # =========================
+    # 2) Tokenizer + special planning tokens
+    # =========================
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
     tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True)
     special_tokens = build_concept_special_tokens(CONCEPT_TYPE_CONFIGS)
@@ -205,28 +60,27 @@ def train():
     if bos_id is None or eos_id is None:
         raise RuntimeError("Tokenizer must provide BOS/EOS ids.")
 
-    if MODEL_DTYPE == "bf16":
-        model_dtype = torch.bfloat16
-    elif MODEL_DTYPE == "fp16":
-        model_dtype = torch.float16
-    else:
-        model_dtype = torch.float32
+    # =========================
+    # 3) Model dtype + backbone loading
+    # =========================
+    dtype_map = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
+    model_dtype = dtype_map.get(MODEL_DTYPE, torch.float32)
 
     model_kwargs = {
         "torch_dtype": model_dtype if torch.cuda.is_available() else torch.float32,
     }
     if torch.cuda.is_available() and ATTENTION_IMPL:
-        # Optional acceleration when current GPU/runtime supports FA.
+        # Optional acceleration when GPU/runtime supports the target attention implementation.
         model_kwargs["attn_implementation"] = ATTENTION_IMPL
-    try:
-        model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
-    except Exception as e:
-        if "attn_implementation" in model_kwargs:
-            logging.warning(f"[WARN] attn_implementation={ATTENTION_IMPL} failed ({e}), falling back to sdpa")
-            model_kwargs["attn_implementation"] = "sdpa"
-            model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
-        else:
-            raise
+    model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
+
+    # =========================
+    # 4) Resize embeddings + apply LoRA (or load LoRA on resume)
+    # =========================
     base_vocab_size = model_base.get_input_embeddings().num_embeddings
     # HF 默认保留旧行、只初始化新增行
     model_base.resize_token_embeddings(len(tokenizer))
@@ -245,6 +99,9 @@ def train():
         model_base = get_peft_model(model_base, lora_cfg)
     model_base.print_trainable_parameters()
 
+    # =========================
+    # 5) Build unified model and optional resume head states
+    # =========================
     metas = build_concept_metas(tokenizer, CONCEPT_TYPE_CONFIGS, device=device)
     num_type_embeddings = 1 + len(metas)
     model = SharedBackboneUnifiedHead(
@@ -264,25 +121,29 @@ def train():
             model.output_head_base.load_state_dict(head_state["output_head_base"])
             if model.output_head_new is not None and head_state.get("output_head_new") is not None:
                 model.output_head_new.load_state_dict(head_state["output_head_new"])
-        elif "output_head" in head_state:
-            # Backward-compatible load from monolithic head.
-            state = head_state["output_head"]
-            weight = state.get("weight", None)
-            if weight is None:
-                raise RuntimeError("output_head state missing weight.")
-            base_rows = model.base_vocab_size
-            model.output_head_base.weight.data.copy_(weight[:base_rows])
-            if model.output_head_new is not None:
-                model.output_head_new.weight.data.copy_(weight[base_rows:])
         else:
             raise RuntimeError("No output head state found in checkpoint.")
         model.type_embed.load_state_dict(head_state["type_embed"])
+        token_embed_new = head_state.get("token_embed_new")
+        if token_embed_new is not None and token_embed_new.numel() > 0:
+            expected_new_rows = model.vocab_size - model.base_vocab_size
+            assert model.token_embed_new is not None, "Checkpoint has token_embed_new but model has no new-token embedding rows."
+            assert token_embed_new.shape[0] == expected_new_rows, (
+                f"token_embed_new rows mismatch: {token_embed_new.shape[0]} vs {expected_new_rows}"
+            )
+            model.token_embed_new.weight.data.copy_(token_embed_new.to(
+                device=device,
+                dtype=model.token_embed_new.weight.dtype,
+            ))
         if "planner_quota" in head_state and head_state["planner_quota"] is not None:
             model.planner_quota.load_state_dict(head_state["planner_quota"], device=device)
         saved_step = head_state.get("step", 0)
         if isinstance(saved_step, int):
             resume_step = saved_step
 
+    # =========================
+    # 6) Optional precision / compile tweaks
+    # =========================
     # Optional FP32 casting for specific trainable params.
     # On A800, keeping large heads in bf16/fp16 is usually faster.
     fp32_casted = 0
@@ -307,6 +168,9 @@ def train():
         except Exception as e:
             logging.warning(f"[WARN] torch.compile failed: {e}")
 
+    # =========================
+    # 7) Build masks
+    # =========================
     blocked_ids = build_executor_blocklist(metas, plan_token_id=plan_token_id)
     vocab_size = model_base.get_input_embeddings().num_embeddings
     mask_cache = ConceptMaskCache(
@@ -318,27 +182,41 @@ def train():
     )
     logging.info(f"[INFO] Model and tokenizer initialized. Starting data loading...")
 
+    # =========================
+    # 8) Dataset and dataloader
+    # =========================
     dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
     collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
+    dataloader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": True,
+        "num_workers": 8,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": collate_fn,
+        "drop_last": True,
+        "prefetch_factor": 4,
+        "persistent_workers": True,
+    }
+    if torch.cuda.is_available():
+        # Supported only in PyTorch 2.0+ and CUDA runtime.
+        dataloader_kwargs["pin_memory_device"] = "cuda"
     dataloader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        pin_memory_device="cuda", # Supported only in PyTorch 2.0+ and when CUDA is available
-        collate_fn=collate_fn,
-        drop_last=True,
-        prefetch_factor=4,
-        persistent_workers=True,
+        **dataloader_kwargs,
     )
 
+    # =========================
+    # 9) Optimizer / scheduler / AMP / resume trainer state
+    # =========================
     optim_params = [p for p in model.parameters() if p.requires_grad]
-    if not optim_params:
-        raise RuntimeError("No trainable parameters found. Check LoRA/parameter-freeze setup.")
+    assert optim_params, "No trainable parameters found. Check model.requires_grad settings."
     output_head_params = list(model.output_head_new.parameters()) if model.output_head_new is not None else []
+    token_embed_params = [model.token_embed_new.weight] if model.token_embed_new is not None else []
     output_head_param_ids = {id(p) for p in output_head_params}
-    base_params = [p for p in optim_params if id(p) not in output_head_param_ids]
+    token_embed_param_ids = {id(p) for p in token_embed_params}
+    base_params = [
+        p for p in optim_params if id(p) not in output_head_param_ids and id(p) not in token_embed_param_ids
+    ]
     optimizer_groups = []
     if base_params:
         optimizer_groups.append(
@@ -348,6 +226,10 @@ def train():
         optimizer_groups.append(
             {"params": output_head_params, "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.0}
         )
+    if token_embed_params:
+        optimizer_groups.append(
+            {"params": token_embed_params, "lr": LR, "betas": (0.9, 0.95), "weight_decay": 0.0}
+        )
     optimizer = torch.optim.AdamW(optimizer_groups)
     total_steps = math.ceil(len(dataloader) / GRAD_ACCUM) * EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
@@ -356,7 +238,12 @@ def train():
     use_amp = torch.cuda.is_available() and model_dtype in (torch.float16, torch.bfloat16)
     use_scaler = torch.cuda.is_available() and model_dtype == torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler) if torch.cuda.is_available() else None
-    if RESUME_ENABLED and os.path.isfile(resume_trainer_state_path):
+    if RESUME_ENABLED:
+        if not os.path.isfile(resume_trainer_state_path):
+            logging.warning(
+                f"[WARN] trainer_state.pt not found at {resume_trainer_state_path}, "
+                "resume without optimizer/scheduler/scaler state"
+            )
         trainer_state = torch.load(resume_trainer_state_path, map_location="cpu")
         if "optimizer" in trainer_state:
             optimizer.load_state_dict(trainer_state["optimizer"])
@@ -365,16 +252,12 @@ def train():
         if scaler is not None and scaler.is_enabled() and "scaler" in trainer_state:
             scaler.load_state_dict(trainer_state["scaler"])
         resume_step = int(trainer_state.get("step", resume_step))
-    elif RESUME_ENABLED:
-        logging.warning(
-            f"[WARN] trainer_state.pt not found at {resume_trainer_state_path}, "
-            "resume without optimizer/scheduler/scaler state"
-        )
+        
 
     logging.info(f"[INFO] vocab size: {vocab_size}")
     logging.info(f"[INFO] output_head frozen rows: [0, {base_vocab_size})")
     new_rows = max(0, vocab_size - base_vocab_size)
-    effective_head_params = new_rows * model.token_embed.embedding_dim
+    effective_head_params = new_rows * model.hidden_size
     logging.info(
         f"[INFO] output_head trainable rows: [{base_vocab_size}, {vocab_size}) "
         f"({new_rows} rows, {effective_head_params:,} params)"
@@ -386,6 +269,9 @@ def train():
     ratio = 100.0 * trainable_params / max(1, all_params)
     logging.info(f"[INFO] trainable params: {trainable_params:,} / {all_params:,} ({ratio:.4f}%)")
 
+    # =========================
+    # 10) Training loop with two-stage forward, loss computation, logging, and checkpointing
+    # =========================
     model.train()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
