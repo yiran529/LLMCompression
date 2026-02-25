@@ -7,7 +7,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.config import *
+from src.config.inference_config import *
 from src.model import *
 @dataclass
 class InferenceRuntime:

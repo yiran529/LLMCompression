@@ -103,3 +103,5 @@ def apply_runtime_settings() -> None:
 
 
 apply_runtime_settings()
+
+############# wandb config #############
