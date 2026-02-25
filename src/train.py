@@ -15,9 +15,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
-from src.config import *
+from src.config.train_config import *
 from src.model import *
-from src.utils.trainer_utils import *
+from src.utils.train_utils import *
 
 def train():
     """run two-stage concept-first training with a shared backbone and one output head."""
