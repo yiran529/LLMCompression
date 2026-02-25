@@ -7,11 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-try:
-    from .config import BETA_COMMIT, EPS, TYPE_ID_TEXT, ConceptTypeConfig
-except ImportError:
-    from config import BETA_COMMIT, EPS, TYPE_ID_TEXT, ConceptTypeConfig
 
+from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_TEXT, ConceptTypeConfig
 
 def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = False) -> torch.Tensor:
     """sample relaxed/straight-through categorical vectors from logits."""

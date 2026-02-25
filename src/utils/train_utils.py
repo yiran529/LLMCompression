@@ -278,7 +278,7 @@ def init_wandb_run(
             new_rows=new_rows,
             device=device,
         ),
-        "mode": os.getenv("WANDB_MODE", "online"),
+        "mode": "online", #! 暂时先写死online，后续可以通过环境变量WANDB_MODE切换到offline或disabled
         "save_code": True,
         "dir": OUTPUT_DIR,
         "settings": wandb.Settings(x_stats_sampling_interval=15),
