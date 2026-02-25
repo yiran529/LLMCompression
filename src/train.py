@@ -244,14 +244,15 @@ def train():
                 f"[WARN] trainer_state.pt not found at {resume_trainer_state_path}, "
                 "resume without optimizer/scheduler/scaler state"
             )
-        trainer_state = torch.load(resume_trainer_state_path, map_location="cpu")
-        if "optimizer" in trainer_state:
-            optimizer.load_state_dict(trainer_state["optimizer"])
-        if "scheduler" in trainer_state:
-            scheduler.load_state_dict(trainer_state["scheduler"])
-        if scaler is not None and scaler.is_enabled() and "scaler" in trainer_state:
-            scaler.load_state_dict(trainer_state["scaler"])
-        resume_step = int(trainer_state.get("step", resume_step))
+        else:
+            trainer_state = torch.load(resume_trainer_state_path, map_location="cpu")
+            if "optimizer" in trainer_state:
+                optimizer.load_state_dict(trainer_state["optimizer"])
+            if "scheduler" in trainer_state:
+                scheduler.load_state_dict(trainer_state["scheduler"])
+            if scaler is not None and scaler.is_enabled() and "scaler" in trainer_state:
+                scaler.load_state_dict(trainer_state["scaler"])
+            resume_step = int(trainer_state.get("step", resume_step))
         
 
     logging.info(f"[INFO] vocab size: {vocab_size}")
@@ -270,7 +271,20 @@ def train():
     logging.info(f"[INFO] trainable params: {trainable_params:,} / {all_params:,} ({ratio:.4f}%)")
 
     # =========================
-    # 10) Training loop with two-stage forward, loss computation, logging, and checkpointing
+    # 10) Initialize wandb tracking (best-default behavior)
+    # =========================
+    wandb_run = init_wandb_run(
+        model=model,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        trainable_params=trainable_params,
+        all_params=all_params,
+        new_rows=new_rows,
+        device=device,
+    )
+
+    # =========================
+    # 11) Training loop with two-stage forward, logging, wandb metrics, and checkpointing
     # =========================
     model.train()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -280,9 +294,12 @@ def train():
     start_time = time.time()
 
     global_step = resume_step
+    log_every = max(1, LOG_STEPS)
     for epoch in range(EPOCHS):
         epoch_losses: List[float] = []
         optimizer.zero_grad(set_to_none=True)
+        tokens_since_last_step = 0
+        step_timer_start = time.perf_counter()
 
         micro_step = 0
         prefetcher = CUDAPrefetcher(dataloader, device=device)
@@ -291,10 +308,16 @@ def train():
         while batch is not None:
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
+            tokens_since_last_step += int(attention_mask.sum().item())
 
             tau = get_adaptive_tau(global_step, total_steps, TAU_INIT, TAU_MIN)
+            will_do_step = ((micro_step + 1) % GRAD_ACCUM == 0) or (prefetcher.next_batch is None)
+            should_profile_step = will_do_step and ((global_step + 1) % log_every == 0)
+            profile_cuda = should_profile_step and torch.cuda.is_available()
+            stage_metrics: Dict[str, float] = {}
 
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
+                planner_stage_state = cuda_stage_begin(profile_cuda)
                 # Stage 1 (Planner): source text -> typed concept sequences.
                 (
                     planner_out,
@@ -315,7 +338,9 @@ def train():
                     base_vocab_size=base_vocab_size,
                     device=device,
                 )
+                stage_metrics.update(cuda_stage_end("planner", planner_stage_state))
 
+                execute_stage_state = cuda_stage_begin(profile_cuda)
                 # Build concept-only prefix for Stage 2.
                 (
                     prefix_embeds,
@@ -384,6 +409,7 @@ def train():
                     + LAMBDA_EOS * loss_eos
                     + loss_quota
                 ).float()
+                stage_metrics.update(cuda_stage_end("execute", execute_stage_state))
 
             if not torch.isfinite(loss):
                 logging.warning("[WARN] non-finite loss, skip batch")
@@ -391,11 +417,13 @@ def train():
                 batch = prefetcher.next()
                 continue
 
+            bptt_stage_state = cuda_stage_begin(profile_cuda)
             loss_scaled = loss / GRAD_ACCUM
             if scaler is not None and scaler.is_enabled():
                 scaler.scale(loss_scaled).backward()
             else:
                 loss_scaled.backward()
+            stage_metrics.update(cuda_stage_end("bptt", bptt_stage_state))
 
             micro_step += 1
             is_last_in_epoch = prefetcher.next_batch is None
@@ -404,12 +432,15 @@ def train():
                 batch = prefetcher.next()
                 continue
 
+            optim_stage_state = cuda_stage_begin(profile_cuda)
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
 
             trainable_with_grad = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
             if not trainable_with_grad:
                 optimizer.zero_grad(set_to_none=True)
+                tokens_since_last_step = 0
+                step_timer_start = time.perf_counter()
                 batch = prefetcher.next()
                 continue
 
@@ -428,6 +459,7 @@ def train():
                 did_step = True
             else:
                 logging.warning("[WARN] non-finite grad norm, skip optimizer step")
+            stage_metrics.update(cuda_stage_end("optimizer", optim_stage_state))
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -436,8 +468,13 @@ def train():
                 global_step += 1
                 epoch_losses.append(float(loss.detach().cpu()))
 
-                if global_step % LOG_STEPS == 0:
-                    recent = epoch_losses[-min(LOG_STEPS, len(epoch_losses)) :]
+                step_wall_time = time.perf_counter() - step_timer_start
+                step_tokens = tokens_since_last_step
+                tokens_since_last_step = 0
+                step_timer_start = time.perf_counter()
+
+                if global_step % log_every == 0:
+                    recent = epoch_losses[-min(log_every, len(epoch_losses)) :]
                     avg_loss = sum(recent) / max(1, len(recent))
                     avg_lens = []
                     for out_type in planner_out.per_type:
@@ -457,7 +494,33 @@ def train():
                         f"QuotaLam {float(model.planner_quota.lambda_value.detach().cpu()):.4f} | "
                         f"TypeLens {','.join([f'{x:.2f}' for x in avg_lens])} | "
                         f"Tau {tau:.4f} | "
-                        f"LR {scheduler.get_last_lr()[0]:.2e}"
+                        f"LR {scheduler.get_last_lr()[0]:.2e} | "
+                        f"Tok/s {step_tokens / max(step_wall_time, 1e-9):.1f}"
+                    )
+
+                    log_wandb_step_metrics(
+                        wandb_run=wandb_run,
+                        global_step=global_step,
+                        epoch=epoch,
+                        metas=metas,
+                        avg_lens=avg_lens,
+                        avg_loss=avg_loss,
+                        loss=loss,
+                        loss_rec=loss_rec,
+                        loss_commit=loss_commit,
+                        loss_unif=loss_unif,
+                        loss_eos=loss_eos,
+                        loss_len=loss_len,
+                        loss_quota=loss_quota,
+                        quota_bar=quota_bar,
+                        quota_lambda=model.planner_quota.lambda_value,
+                        grad_norm=grad_norm,
+                        tau=tau,
+                        lr=scheduler.get_last_lr()[0],
+                        step_wall_time=step_wall_time,
+                        step_tokens=step_tokens,
+                        scaler=scaler,
+                        stage_metrics=stage_metrics,
                     )
 
                 if global_step % SAVE_STEPS == 0:
@@ -471,6 +534,9 @@ def train():
                         scheduler=scheduler,
                         scaler=scaler,
                     )
+            else:
+                tokens_since_last_step = 0
+                step_timer_start = time.perf_counter()
 
             progress_bar.update(1)
             elapsed = time.time() - start_time
@@ -483,8 +549,8 @@ def train():
 
             batch = prefetcher.next()
 
-    progress_bar.close()
-    total_time = timedelta(seconds=int(time.time() - start_time))
+    total_seconds = int(time.time() - start_time)
+    total_time = timedelta(seconds=total_seconds)
     logging.info(f"[DONE] training complete, total time: {total_time}")
     save_checkpoint(
         model,
@@ -495,6 +561,16 @@ def train():
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
+    )
+
+    # =========================
+    # 12) Finalize progress bars and wandb run
+    # =========================
+    progress_bar.close()
+    finish_wandb_run(
+        wandb_run,
+        total_seconds=int(time.time() - start_time),
+        final_global_step=global_step,
     )
 
 if __name__ == "__main__":

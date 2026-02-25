@@ -105,3 +105,6 @@ def apply_runtime_settings() -> None:
 apply_runtime_settings()
 
 ############# wandb config #############
+WANDB_PROJECT = "token-compression"
+WANDB_RUN_NAME = ""
+WANDB_ENTITY = ""
