@@ -370,11 +370,11 @@ def log_wandb_step_metrics(
         free_mem, total_mem = torch.cuda.mem_get_info()
         metrics.update(
             {
-                "gpu/memory_allocated_mb": to_mb(alloc),
-                "gpu/memory_reserved_mb": to_mb(reserved),
-                "gpu/memory_free_mb": to_mb(free_mem),
-                "gpu/memory_total_mb": to_mb(total_mem),
-                "gpu/memory_utilization": float((total_mem - free_mem) / max(1, total_mem)),
+                "gpu/memory_allocated_mb": to_mb(alloc),  # 当前被张量实际占用的显存（MB）
+                "gpu/memory_reserved_mb": to_mb(reserved),  # CUDA 缓存分配器向驱动保留的显存（MB）
+                "gpu/memory_free_mb": to_mb(free_mem),  # 设备当前可用显存（MB，来自 mem_get_info）
+                "gpu/memory_total_mb": to_mb(total_mem),  # 设备总显存（MB，来自 mem_get_info）
+                "gpu/memory_utilization": float((total_mem - free_mem) / max(1, total_mem)),  # 显存使用率（0~1）
             }
         )
         metrics.update(stage_metrics)

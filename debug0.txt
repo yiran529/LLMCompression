@@ -1,0 +1,153 @@
+[PlannerDebug] input preview
+  sample=0 real_len=64 input_ids_head20=[2082, 1113, 2142, 374, 264, 4948, 19128, 323, 7203, 429, 374, 66351, 938, 315, 11198, 323, 59415, 678, 90505, 11]
+  sample=1 real_len=64 input_ids_head20=[2082, 1113, 2142, 50142, 264, 19492, 315, 25342, 304, 1973, 311, 3367, 1181, 10507, 10335, 892, 646, 387, 42929, 18663]
+  sample=2 real_len=64 input_ids_head20=[785, 1156, 4948, 54375, 311, 1618, 5561, 458, 77331, 1719, 572, 36977, 12009, 960, 759, 393, 581, 30621, 263, 320]
+  sample=3 real_len=64 input_ids_head20=[7983, 13758, 311, 279, 1584, 374, 8622, 311, 77331, 3381, 11, 26312, 43465, 2142, 374, 537, 458, 4135, 3383, 369]
+[PlannerDebug] begin
+  PrimeForward | per-sample stats (vs sample0)
+    sample=0 prompt_true_len=66 hidden_norm=172.029297 logits_norm=5180.318848 logits_mean=-1.255601e+01 logits_std=4.073610e+00 logits_max_abs=2.962500e+01 hidden_max_abs_diff_vs0=0.000000e+00 logits_max_abs_diff_vs0=0.000000e+00 bottom_concept_mean=-9.041057e+00 bottom_concept_std=8.602749e+00 bottom_concept_max_abs=1.862500e+01 bottom_concept_margin(top1-top2)=0.000000e+00 bottom_concept_diff_vs0=0.000000e+00 bottom_concept_centered_diff_vs0=0.000000e+00
+    sample=1 prompt_true_len=66 hidden_norm=162.919464 logits_norm=4387.129883 logits_mean=-1.050294e+01 logits_std=3.828953e+00 logits_max_abs=2.612500e+01 hidden_max_abs_diff_vs0=1.150000e+01 logits_max_abs_diff_vs0=7.656250e+00 bottom_concept_mean=-7.140343e+00 bottom_concept_std=7.835418e+00 bottom_concept_max_abs=1.575000e+01 bottom_concept_margin(top1-top2)=0.000000e+00 bottom_concept_diff_vs0=2.875000e+00 bottom_concept_centered_diff_vs0=2.025715e+00
+    sample=2 prompt_true_len=66 hidden_norm=168.237061 logits_norm=4736.986328 logits_mean=-1.139666e+01 logits_std=3.976888e+00 logits_max_abs=2.737500e+01 hidden_max_abs_diff_vs0=7.250000e+00 logits_max_abs_diff_vs0=4.500000e+00 bottom_concept_mean=-7.963580e+00 bottom_concept_std=8.194700e+00 bottom_concept_max_abs=1.700000e+01 bottom_concept_margin(top1-top2)=0.000000e+00 bottom_concept_diff_vs0=1.625000e+00 bottom_concept_centered_diff_vs0=1.077478e+00
+    sample=3 prompt_true_len=66 hidden_norm=166.679474 logits_norm=4681.095703 logits_mean=-1.124576e+01 logits_std=3.976736e+00 logits_max_abs=2.750000e+01 hidden_max_abs_diff_vs0=8.000000e+00 logits_max_abs_diff_vs0=5.187500e+00 bottom_concept_mean=-7.570126e+00 bottom_concept_std=8.093682e+00 bottom_concept_max_abs=1.675000e+01 bottom_concept_margin(top1-top2)=0.000000e+00 bottom_concept_diff_vs0=1.875000e+00 bottom_concept_centered_diff_vs0=1.345932e+00
+  Step 1 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=0 selected=151680 p_sel=0.0039 H=5.5452 hidden_norm=1.720293e+02 hidden_std=5.355461e+00 hidden_max_abs=6.800000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=-9.041057e+00 concept_std=8.602749e+00 concept_max_abs=1.862500e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 151681:<C_bottom_10>(0.0039) | 151680:<C_bottom_9>(0.0039) | 151682:<C_bottom_11>(0.0039) | 151684:<C_bottom_13>(0.0039) | 151683:<C_bottom_12>(0.0039)
+    sample=1 type=bottom local_step=0 selected=151680 p_sel=0.0039 H=5.5452 hidden_norm=1.629195e+02 hidden_std=5.073402e+00 hidden_max_abs=6.400000e+01 hidden_diff_vs0=1.150000e+01 hidden_centered_diff_vs0=1.145721e+01 hidden_cosine_vs0=0.977831 concept_mean=-7.140343e+00 concept_std=7.835418e+00 concept_max_abs=1.575000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=2.875000e+00 concept_centered_diff_vs0=2.025715e+00
+      topk: 151681:<C_bottom_10>(0.0039) | 151680:<C_bottom_9>(0.0039) | 151682:<C_bottom_11>(0.0039) | 151684:<C_bottom_13>(0.0039) | 151683:<C_bottom_12>(0.0039)
+    sample=2 type=bottom local_step=0 selected=151680 p_sel=0.0039 H=5.5452 hidden_norm=1.682371e+02 hidden_std=5.237455e+00 hidden_max_abs=6.375000e+01 hidden_diff_vs0=7.250000e+00 hidden_centered_diff_vs0=7.239090e+00 hidden_cosine_vs0=0.988877 concept_mean=-7.963580e+00 concept_std=8.194700e+00 concept_max_abs=1.700000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=1.625000e+00 concept_centered_diff_vs0=1.077478e+00
+      topk: 151681:<C_bottom_10>(0.0039) | 151680:<C_bottom_9>(0.0039) | 151682:<C_bottom_11>(0.0039) | 151684:<C_bottom_13>(0.0039) | 151683:<C_bottom_12>(0.0039)
+    sample=3 type=bottom local_step=0 selected=151680 p_sel=0.0039 H=5.5452 hidden_norm=1.666795e+02 hidden_std=5.189801e+00 hidden_max_abs=6.125000e+01 hidden_diff_vs0=8.000000e+00 hidden_centered_diff_vs0=7.975185e+00 hidden_cosine_vs0=0.989820 concept_mean=-7.570126e+00 concept_std=8.093682e+00 concept_max_abs=1.675000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=1.875000e+00 concept_centered_diff_vs0=1.345932e+00
+      topk: 151681:<C_bottom_10>(0.0039) | 151680:<C_bottom_9>(0.0039) | 151682:<C_bottom_11>(0.0039) | 151684:<C_bottom_13>(0.0039) | 151683:<C_bottom_12>(0.0039)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 2 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=1 selected=153044 p_sel=0.0008 H=7.4745 hidden_norm=1.035713e+02 hidden_std=3.236577e+00 hidden_max_abs=2.337500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.232088e+01 concept_std=4.756193e+00 concept_max_abs=1.456250e+01 margin(top1-top2)=6.250000e-02 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 153044:<C_bottom_1373>(0.0008) | 152175:<C_bottom_504>(0.0008) | 151958:<C_bottom_287>(0.0008) | 152205:<C_bottom_534>(0.0008) | 152170:<C_bottom_499>(0.0008)
+    sample=1 type=bottom local_step=1 selected=153044 p_sel=0.0008 H=7.4745 hidden_norm=1.035713e+02 hidden_std=3.236577e+00 hidden_max_abs=2.337500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.232088e+01 concept_std=4.756193e+00 concept_max_abs=1.456250e+01 margin(top1-top2)=6.250000e-02 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 153044:<C_bottom_1373>(0.0008) | 152175:<C_bottom_504>(0.0008) | 151958:<C_bottom_287>(0.0008) | 152205:<C_bottom_534>(0.0008) | 152170:<C_bottom_499>(0.0008)
+    sample=2 type=bottom local_step=1 selected=153044 p_sel=0.0008 H=7.4745 hidden_norm=1.035713e+02 hidden_std=3.236577e+00 hidden_max_abs=2.337500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.232088e+01 concept_std=4.756193e+00 concept_max_abs=1.456250e+01 margin(top1-top2)=6.250000e-02 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 153044:<C_bottom_1373>(0.0008) | 152175:<C_bottom_504>(0.0008) | 151958:<C_bottom_287>(0.0008) | 152205:<C_bottom_534>(0.0008) | 152170:<C_bottom_499>(0.0008)
+    sample=3 type=bottom local_step=1 selected=153044 p_sel=0.0008 H=7.4745 hidden_norm=1.035713e+02 hidden_std=3.236577e+00 hidden_max_abs=2.337500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.232088e+01 concept_std=4.756193e+00 concept_max_abs=1.456250e+01 margin(top1-top2)=6.250000e-02 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 153044:<C_bottom_1373>(0.0008) | 152175:<C_bottom_504>(0.0008) | 151958:<C_bottom_287>(0.0008) | 152205:<C_bottom_534>(0.0008) | 152170:<C_bottom_499>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 3 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=2 selected=152170 p_sel=0.0008 H=7.4766 hidden_norm=9.406326e+01 hidden_std=2.939472e+00 hidden_max_abs=2.112500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.155271e+01 concept_std=4.481895e+00 concept_max_abs=1.362500e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152306:<C_bottom_635>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152457:<C_bottom_786>(0.0008) | 153500:<C_bottom_1829>(0.0008) | 153044:<C_bottom_1373>(0.0008)
+    sample=1 type=bottom local_step=2 selected=152170 p_sel=0.0008 H=7.4766 hidden_norm=9.406326e+01 hidden_std=2.939472e+00 hidden_max_abs=2.112500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.155271e+01 concept_std=4.481895e+00 concept_max_abs=1.362500e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152306:<C_bottom_635>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152457:<C_bottom_786>(0.0008) | 153500:<C_bottom_1829>(0.0008) | 153044:<C_bottom_1373>(0.0008)
+    sample=2 type=bottom local_step=2 selected=152170 p_sel=0.0008 H=7.4766 hidden_norm=9.406326e+01 hidden_std=2.939472e+00 hidden_max_abs=2.112500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.155271e+01 concept_std=4.481895e+00 concept_max_abs=1.362500e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152306:<C_bottom_635>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152457:<C_bottom_786>(0.0008) | 153500:<C_bottom_1829>(0.0008) | 153044:<C_bottom_1373>(0.0008)
+    sample=3 type=bottom local_step=2 selected=152170 p_sel=0.0008 H=7.4766 hidden_norm=9.406326e+01 hidden_std=2.939472e+00 hidden_max_abs=2.112500e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.155271e+01 concept_std=4.481895e+00 concept_max_abs=1.362500e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152306:<C_bottom_635>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152457:<C_bottom_786>(0.0008) | 153500:<C_bottom_1829>(0.0008) | 153044:<C_bottom_1373>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 4 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=3 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=1 type=bottom local_step=3 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=2 type=bottom local_step=3 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=3 type=bottom local_step=3 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 5 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=4 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=1 type=bottom local_step=4 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=2 type=bottom local_step=4 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=3 type=bottom local_step=4 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 6 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=5 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=1 type=bottom local_step=5 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=2 type=bottom local_step=5 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=3 type=bottom local_step=5 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+  Step 7 | deterministic=True | tau=0.2000
+    sample=0 type=bottom local_step=6 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=1 type=bottom local_step=6 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=2 type=bottom local_step=6 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    sample=3 type=bottom local_step=6 selected=152170 p_sel=0.0008 H=7.4765 hidden_norm=9.410021e+01 hidden_std=2.940628e+00 hidden_max_abs=2.100000e+01 hidden_diff_vs0=0.000000e+00 hidden_centered_diff_vs0=0.000000e+00 hidden_cosine_vs0=1.000000 concept_mean=1.163239e+01 concept_std=4.503967e+00 concept_max_abs=1.375000e+01 margin(top1-top2)=0.000000e+00 concept_diff_vs0=0.000000e+00 concept_centered_diff_vs0=0.000000e+00
+      topk: 152457:<C_bottom_786>(0.0008) | 152170:<C_bottom_499>(0.0008) | 152801:<C_bottom_1130>(0.0008) | 152580:<C_bottom_909>(0.0008) | 152306:<C_bottom_635>(0.0008)
+    summary: same_selected=True same_top1=True p_sel_span=0.000000 entropy_span=0.000000
+[PlannerDebug] end
+
+-----------------------------------------------
+
+sample: 当前 batch 内样本索引（从 0 开始）。
+real_len: 该样本有效 token 长度（attention_mask 求和）。
+input_ids_head20: 输入序列前 20 个 token id，用于快速确认样本内容是否不同。
+PrimeForward: planner 前缀一次性前向（BOS+文本+PLAN）后的统计阶段。
+prompt_true_len: planner 前缀有效长度（含 BOS 与 PLAN）。
+hidden_norm: PrimeForward 末位置隐藏状态向量的 L2 范数。
+logits_norm: PrimeForward 末位置全词表 logits 向量的 L2 范数。
+logits_mean: PrimeForward 末位置全词表 logits 的均值。
+logits_std: PrimeForward 末位置全词表 logits 的标准差。
+logits_max_abs: PrimeForward 末位置全词表 logits 的最大绝对值。
+hidden_max_abs_diff_vs0: 当前样本与 sample0 在 PrimeForward 隐藏向量上的最大绝对差。
+logits_max_abs_diff_vs0: 当前样本与 sample0 在 PrimeForward 全词表 logits 上的最大绝对差。
+bottom_concept_mean: PrimeForward 时 bottom 概念子词表 logits 的均值。
+bottom_concept_std: PrimeForward 时 bottom 概念子词表 logits 的标准差。
+bottom_concept_max_abs: PrimeForward 时 bottom 概念子词表 logits 的最大绝对值。
+bottom_concept_margin(top1-top2): PrimeForward 时 bottom 概念子词表 top1 与 top2 的 logit 差值。
+bottom_concept_diff_vs0: PrimeForward 时当前样本与 sample0 在 bottom 概念子词表 logits 的最大绝对差。
+bottom_concept_centered_diff_vs0: PrimeForward 时先按样本减去各自均值后，当前样本与 sample0 在 bottom 概念 logits 的最大绝对差。
+Step N: planner 自回归解码的第 N 步（日志里的 Step 1 对应 local_step=0）。
+deterministic: 是否使用确定性选择（argmax）而非 gumbel 采样。
+tau: gumbel/softmax 温度参数（deterministic=True 时仅作记录）。
+type: 当前解码的概念层级类型（如 bottom/mid/top）。
+local_step: 当前概念类型内的局部步数。
+selected: 当前步最终选中的概念 token id。
+p_sel: selected 在当前允许概念子词表中的概率。
+H: 当前允许概念子词表分布熵（越大越平，越小越尖）。
+concept_mean: 当前步允许概念子词表 logits 的均值。
+concept_std: 当前步允许概念子词表 logits 的标准差。
+concept_max_abs: 当前步允许概念子词表 logits 的最大绝对值。
+margin(top1-top2): 当前步允许概念子词表 top1 与 top2 的 logit 差值。
+concept_diff_vs0: 当前步当前样本与 sample0 在同类型概念子词表 logits 的最大绝对差。
+concept_centered_diff_vs0: 当前步先按样本去均值后，当前样本与 sample0 在同类型概念 logits 的最大绝对差。
+topk: 当前步概念子词表 top-k 候选（token id/字符串/概率）。
+summary: 当前步跨样本一致性摘要。
+same_selected: 当前步所有样本是否选择了同一个 token。
+same_top1: 当前步所有样本的 top1 候选是否相同。
+p_sel_span: 当前步各样本 p_sel 的极差（max-min）。
+entropy_span: 当前步各样本熵 H 的极差（max-min）。
+
+-----------------------------------------------
+新增指标含义补充:
+hidden_std: 当前步 head 输入向量（hidden）的逐维标准差。
+hidden_max_abs: 当前步 hidden 向量逐维绝对值的最大值。
+hidden_diff_vs0: 当前步当前样本与 sample0 的 hidden 向量逐维最大绝对差。
+hidden_centered_diff_vs0: 当前步先对 hidden 去均值后，当前样本与 sample0 的逐维最大绝对差。
+hidden_cosine_vs0: 当前步当前样本与 sample0 的 hidden 向量余弦相似度（1 表示方向完全一致）。
+concept_margin(top1-top2): 当前步概念子词表中 top1 与 top2 的 logit 间隔，越接近 0 越容易出现并列或排序不稳定。
+
+------------------------------------------------
+
+关键表面现象总结（分点）:
+- 输入样本确实不同（input_ids_head20 差异明显），排除“输入完全相同”导致的同输出。
+- PrimeForward 阶段跨样本 hidden/logits 存在明显差异（hidden_max_abs_diff_vs0 与 logits_max_abs_diff_vs0 非零），说明前缀条件信息已进入模型。
+- Step1 阶段 hidden 仍有差异（hidden_diff_vs0 非零，hidden_cosine_vs0<1），但概念分布已高度同构（same_selected=True、same_top1=True、p_sel_span=0、entropy_span=0, hidden_cosine_vs0 ~ 0.99）。
+- Step1 的 concept margin(top1-top2)=0 显示概念子词表存在并列 top1，确定性 argmax 会固定落到同一 token，放大“所有样本同 token”现象。
+- 从 Step2 起 hidden 端完全同化（hidden_diff_vs0=0、hidden_centered_diff_vs0=0、hidden_cosine_vs0=1），不是只在 head 输出端同化。
+- 从 Step2 起 concept 端也完全同化（concept_diff_vs0=0、concept_centered_diff_vs0=0），与 hidden 同化同步，表现为后续概念序列跨样本锁死一致。
+
+------------------------------------------------
+现象：
+推理时，多条不同的输入文本在第一步概念选择时就全部选中了同一个概念 token，后续每一步的概念选择都完全一致，最终生成了同样的概念序列和重建文本（而且重建文本毫无意义，除了第一个词外后续都是重复的词）。
+关键表面现象总结:
+- 排查首先确认了输入并不相同：同一批次里的几条文本内容明显不同，因此“输出一样”不是因为喂给模型的是同一条数据。
+- 在最开始的初始化前向阶段，模型内部状态和预测分数在不同样本之间是有差异的（尽管差异也还是很小），这说明原文信息在一开始确实被模型读到了。
+- 但是在真正开始生成第一枚概念标记时，四个样本就已经给出了几乎完全相同的候选排序和概率，导致所有样本都选中了同一个概念标记。
+- 从第二步开始，这种一致性进一步加重：不同样本在该步使用的内部表示已经完全一致，后续每一步都沿着同一条轨迹继续生成。
+- 换句话说，问题不是“起点就看不到输入”，而是“进入逐步生成后很快丢失了样本之间的区别”，最终表现为概念序列和重建文本都被锁定为同一种模式。
+- 这份日志最直接支持的结论是：异常主要发生在逐步解码阶段的状态推进过程中，而不是数据读取阶段。

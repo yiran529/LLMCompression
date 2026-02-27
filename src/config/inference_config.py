@@ -1,7 +1,7 @@
 from src.config.train_config import *
 
 # Input mode: "default_dataset" | "parquet" | "text_file"
-INFER_INPUT_MODE = "default_dataset"
+INFER_INPUT_MODE = "text_file"
 
 # Checkpoint from training, e.g. "./outputs/checkpoint-200" or "./outputs/final"
 INFER_CKPT_DIR = "./outputs/final"
@@ -17,6 +17,7 @@ INFER_MAX_INPUT_TOKENS = MAX_INPUT_TOKENS
 INFER_MAX_NEW_TOKENS = 64
 INFER_PLANNER_TAU = 0.2
 INFER_MIN_CONCEPT_STEPS = MIN_CONCEPT_STEPS
+INFER_PLANNER_DETERMINISTIC = True
 INFER_MAX_SAMPLES = 20
 INFER_TEXT_COLUMN = "text"
 INFER_SKIP_SPECIAL_TOKENS = True

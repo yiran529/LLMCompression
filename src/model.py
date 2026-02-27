@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -225,6 +225,7 @@ class PlannerOutput:
     per_type: List[PlannerTypeOutput]
     quota_mass_sum: torch.Tensor
     quota_count: torch.Tensor
+    debug_records: Optional[List[Dict[str, Any]]] = None
 
 class PlannerQuotaController:
     def __init__(self, *, tau: float, eta: float, lambda_init: float, device: str):
@@ -309,11 +310,17 @@ def plan_concepts(
     min_concept_steps: int,
     base_vocab_size: int,
     device: str,
+    deterministic: bool = False,
+    debug_collect: bool = False,
+    debug_topk: int = 5,
+    debug_max_steps: int = 8,
+    debug_max_samples: int = 4,
 ) -> PlannerOutput:
     """generate one variable-length concept sequence per type from source input."""
     bsz, _ = input_ids.shape
     hidden_size = model.hidden_size
     dtype_embed = model.token_embed_base.weight.dtype
+    max_debug_samples = max(1, min(int(debug_max_samples), bsz))
 
     # ---------------------------------------------------------------------
     # 1) Build planner prompt.
@@ -346,7 +353,9 @@ def plan_concepts(
         position_ids=planner_pos,
         use_cache=True,
     )
+    prime_hidden = out.last_hidden_state[:, -1, :].float()  # [B, H]
     logits_t = model.forward_head(out.last_hidden_state[:, -1, :])  # [B, V]
+    hidden_t = prime_hidden
     past_kv = out.past_key_values
 
     num_types = len(metas)
@@ -416,6 +425,84 @@ def plan_concepts(
     quota_mass_sum = torch.zeros((), device=device, dtype=torch.float32)
     quota_count = torch.zeros((), device=device, dtype=torch.float32)
 
+    # [FIX] Initialize running attention mask and position IDs for autoregressive generation.
+    # The mask must cover [Prompt + Past_Generated], not just the current step.
+    # The position IDs should ideally be continuous for RoPE-based models to maintain relative distance to the prompt.
+    cache_attention_mask = planner_mask
+    cache_position_ids = planner_pos[:, -1:].clone() + 1
+
+    debug_records: Optional[List[Dict[str, Any]]] = [] if debug_collect else None
+    if debug_collect and debug_records is not None:
+        hidden_diffs: List[float] = []
+        logits_diffs: List[float] = []
+        hidden_norms: List[float] = []
+        logits_norms: List[float] = []
+        logits_means: List[float] = []
+        logits_stds: List[float] = []
+        logits_max_abs: List[float] = []
+        concept_logits_diffs: List[float] = []
+        concept_logits_centered_diffs: List[float] = []
+        concept_logits_stds: List[float] = []
+        concept_logits_means: List[float] = []
+        concept_logits_max_abs: List[float] = []
+        concept_top1_minus_top2: List[float] = []
+        prime_type_idx = 0
+        prime_allowed_ids = metas[prime_type_idx].concept_ids_with_eos
+        prime_concept_logits = logits_t.float().index_select(1, prime_allowed_ids)
+        for b in range(max_debug_samples):
+            hidden_norms.append(float(prime_hidden[b].norm().item()))
+            logits_row = logits_t[b].float()
+            logits_norms.append(float(logits_row.norm().item()))
+            logits_means.append(float(logits_row.mean().item()))
+            logits_stds.append(float(logits_row.std(unbiased=False).item()))
+            logits_max_abs.append(float(logits_row.abs().max().item()))
+            concept_row = prime_concept_logits[b]
+            concept_logits_means.append(float(concept_row.mean().item()))
+            concept_logits_stds.append(float(prime_concept_logits[b].std(unbiased=False).item()))
+            concept_logits_max_abs.append(float(concept_row.abs().max().item()))
+            concept_top2 = torch.topk(concept_row, k=min(2, int(concept_row.numel())), dim=-1).values
+            if concept_top2.numel() >= 2:
+                concept_top1_minus_top2.append(float((concept_top2[0] - concept_top2[1]).item()))
+            else:
+                concept_top1_minus_top2.append(0.0)
+            if b == 0:
+                hidden_diffs.append(0.0)
+                logits_diffs.append(0.0)
+                concept_logits_diffs.append(0.0)
+                concept_logits_centered_diffs.append(0.0)
+            else:
+                hidden_diffs.append(float((prime_hidden[b] - prime_hidden[0]).abs().max().item()))
+                logits_diffs.append(float((logits_row - logits_t[0].float()).abs().max().item()))
+                concept_logits_diffs.append(
+                    float((prime_concept_logits[b] - prime_concept_logits[0]).abs().max().item())
+                )
+                concept_centered_b = concept_row - concept_row.mean()
+                concept_centered_0 = prime_concept_logits[0] - prime_concept_logits[0].mean()
+                concept_logits_centered_diffs.append(
+                    float((concept_centered_b - concept_centered_0).abs().max().item())
+                )
+
+        debug_records.append(
+            {
+                "stage": "prime",
+                "prompt_true_len": [int(x) for x in planner_mask.sum(dim=1).tolist()[:max_debug_samples]],
+                "hidden_norms": hidden_norms,
+                "logits_norms": logits_norms,
+                "logits_means": logits_means,
+                "logits_stds": logits_stds,
+                "logits_max_abs": logits_max_abs,
+                "hidden_max_abs_diff_vs0": hidden_diffs,
+                "logits_max_abs_diff_vs0": logits_diffs,
+                "concept_logits_means": concept_logits_means,
+                "concept_logits_std": concept_logits_stds,
+                "concept_logits_max_abs": concept_logits_max_abs,
+                "concept_logits_max_abs_diff_vs0": concept_logits_diffs,
+                "concept_logits_centered_max_abs_diff_vs0": concept_logits_centered_diffs,
+                "concept_top1_minus_top2": concept_top1_minus_top2,
+                "prime_type_name": metas[prime_type_idx].name,
+            }
+        )
+
     # ---------------------------------------------------------------------
     # 5) Main asynchronous decoding loop.
     # One loop iteration emits exactly one token per active sample.
@@ -464,14 +551,118 @@ def plan_concepts(
                 masked_logits[force_mask] = forced
 
         # Straight-through categorical sample from constrained logits.
-        probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
-        sampled_ids = probs.argmax(dim=-1)  # [B]
+        if deterministic:
+            sampled_ids = masked_logits.argmax(dim=-1)
+            probs = torch.zeros_like(masked_logits)
+            probs.scatter_(1, sampled_ids.unsqueeze(1), 1.0)
+        else:
+            probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
+            sampled_ids = probs.argmax(dim=-1)  # [B]
         # Keep inactive rows deterministic.
         sampled_ids = torch.where(
             active,
             sampled_ids,
             torch.full_like(sampled_ids, int(eos_id_by_type[-1].item())),
         )
+
+        if debug_collect and debug_records is not None:
+            if len(debug_records) < max(1, int(debug_max_steps)):
+                max_samples = max(1, min(int(debug_max_samples), bsz))
+                sample_debug: List[Dict[str, Any]] = []
+                for b in range(max_samples):
+                    type_idx_b = int(type_idx_safe[b].item())
+                    meta_b = metas[type_idx_b]
+                    allowed_ids = meta_b.concept_ids_with_eos
+                    allowed_logits = masked_logits[b].index_select(0, allowed_ids)
+                    allowed_probs = F.softmax(allowed_logits, dim=-1)
+                    k = max(1, min(int(debug_topk), int(allowed_probs.numel())))
+                    top_vals, top_idx = torch.topk(allowed_probs, k=k, dim=-1)
+                    top_token_ids = allowed_ids.index_select(0, top_idx)
+
+                    selected_id = int(sampled_ids[b].item())
+                    selected_prob = 0.0
+                    match = (allowed_ids == selected_id).nonzero(as_tuple=False)
+                    if match.numel() > 0:
+                        selected_prob = float(allowed_probs[match[0, 0]].item())
+
+                    entropy = float((-(allowed_probs * torch.log(allowed_probs + 1e-8))).sum().item())
+                    hidden_row = hidden_t[b].float()
+                    hidden_norm = float(hidden_row.norm().item())
+                    hidden_std = float(hidden_row.std(unbiased=False).item())
+                    hidden_max_abs = float(hidden_row.abs().max().item())
+                    hidden_diff_vs0 = 0.0
+                    hidden_centered_diff_vs0 = 0.0
+                    hidden_cosine_vs0 = 1.0
+                    if b > 0:
+                        hidden_row0 = hidden_t[0].float()
+                        hidden_diff_vs0 = float((hidden_row - hidden_row0).abs().max().item())
+                        hidden_centered = hidden_row - hidden_row.mean()
+                        hidden_centered0 = hidden_row0 - hidden_row0.mean()
+                        hidden_centered_diff_vs0 = float((hidden_centered - hidden_centered0).abs().max().item())
+                        hidden_cosine_vs0 = float(
+                            F.cosine_similarity(
+                                hidden_row.unsqueeze(0),
+                                hidden_row0.unsqueeze(0),
+                                dim=-1,
+                                eps=1e-8,
+                            ).item()
+                        )
+                    logits_mean = float(allowed_logits.mean().item())
+                    concept_logits_std = float(allowed_logits.std(unbiased=False).item())
+                    concept_logits_max_abs = float(allowed_logits.abs().max().item())
+                    top2 = torch.topk(allowed_logits, k=min(2, int(allowed_logits.numel())), dim=-1).values
+                    if top2.numel() >= 2:
+                        top1_minus_top2 = float((top2[0] - top2[1]).item())
+                    else:
+                        top1_minus_top2 = 0.0
+                    concept_logits_diff_vs0 = 0.0
+                    concept_logits_centered_diff_vs0 = 0.0
+                    if b > 0:
+                        type_idx_0 = int(type_idx_safe[0].item())
+                        if type_idx_0 == type_idx_b:
+                            meta_0 = metas[type_idx_0]
+                            allowed_ids_0 = meta_0.concept_ids_with_eos
+                            allowed_logits_0 = masked_logits[0].index_select(0, allowed_ids_0)
+                            concept_logits_diff_vs0 = float((allowed_logits - allowed_logits_0).abs().max().item())
+                            allowed_centered = allowed_logits - allowed_logits.mean()
+                            allowed_centered_0 = allowed_logits_0 - allowed_logits_0.mean()
+                            concept_logits_centered_diff_vs0 = float(
+                                (allowed_centered - allowed_centered_0).abs().max().item()
+                            )
+                    sample_debug.append(
+                        {
+                            "sample_idx": b,
+                            "active": bool(active[b].item()),
+                            "type_name": meta_b.name,
+                            "step_in_type": int(step_before[b].item()),
+                            "selected_id": selected_id,
+                            "selected_prob": selected_prob,
+                            "entropy": entropy,
+                            "hidden_norm": hidden_norm,
+                            "hidden_std": hidden_std,
+                            "hidden_max_abs": hidden_max_abs,
+                            "hidden_max_abs_diff_vs0": hidden_diff_vs0,
+                            "hidden_centered_max_abs_diff_vs0": hidden_centered_diff_vs0,
+                            "hidden_cosine_vs0": hidden_cosine_vs0,
+                            "concept_logits_mean": logits_mean,
+                            "concept_logits_std": concept_logits_std,
+                            "concept_logits_max_abs": concept_logits_max_abs,
+                            "top1_minus_top2": top1_minus_top2,
+                            "concept_logits_max_abs_diff_vs0": concept_logits_diff_vs0,
+                            "concept_logits_centered_max_abs_diff_vs0": concept_logits_centered_diff_vs0,
+                            "topk_token_ids": [int(x) for x in top_token_ids.tolist()],
+                            "topk_probs": [float(x) for x in top_vals.tolist()],
+                        }
+                    )
+
+                debug_records.append(
+                    {
+                        "decode_step": len(debug_records),
+                        "deterministic": bool(deterministic),
+                        "tau": float(tau),
+                        "samples": sample_debug,
+                    }
+                )
 
         # Build one-step inputs for the next backbone call.
         # We keep full [B, ...] tensors for efficient batched forward.
@@ -565,14 +756,28 @@ def plan_concepts(
 
         # Straight-through one-step input to advance shared KV cache.
         st_embed = hard_embed_step + (soft_embed_step - soft_embed_step.detach())  # [B, H]
+
+        # [FIX] Update attention mask and position IDs for the next step.
+        # AR generation requires position IDs to increase monotonically to maintain RoPE relative distances,
+        # unless specific "restart" semantics are intended. Given concepts are generated sequentially, 
+        # continuous position IDs are safer to avoid attention anomalies.
+        # We ignore the per-type `step_pos` reset logic for the BACKBONE forward pass to keep the LM context valid.
+        
+        cache_attention_mask = torch.cat(
+            [cache_attention_mask, torch.ones((bsz, 1), device=device, dtype=torch.long)],
+            dim=1
+        )
+        cache_position_ids = cache_position_ids + 1
+
         out_next = model.forward_backbone(
             inputs_embeds=st_embed.unsqueeze(1),  # [B, 1, H]
-            attention_mask=ones_step,             # [B, 1]
-            position_ids=step_pos,                # [B, 1]
+            attention_mask=cache_attention_mask,  # [B, T_curr]
+            position_ids=cache_position_ids,      # [B, 1]
             past_key_values=past_kv,
             use_cache=True,
         )
         logits_t = model.forward_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
+        hidden_t = out_next.last_hidden_state[:, -1, :].float()
         past_kv = out_next.past_key_values
 
     # ---------------------------------------------------------------------
@@ -623,6 +828,7 @@ def plan_concepts(
             per_type=per_type_outputs,
             quota_mass_sum=quota_mass_sum,
             quota_count=quota_count,
+            debug_records=debug_records,
         ),
         loss_commit,
         loss_unif,
@@ -781,6 +987,11 @@ def run_executor_inference(
     max_new_tokens: int = 64,
     planner_tau: float = 0.2,
     min_concept_steps: int = 1,
+    planner_deterministic: bool = False,
+    planner_debug_collect: bool = False,
+    planner_debug_topk: int = 5,
+    planner_debug_max_steps: int = 8,
+    planner_debug_max_samples: int = 4,
 ) -> ExecutorInferenceOutput:
     """run planner->prefix->executor greedy decoding for inference."""
     bsz = input_ids.size(0)
@@ -801,6 +1012,11 @@ def run_executor_inference(
             min_concept_steps=min_concept_steps,
             base_vocab_size=model.base_vocab_size,
             device=device,
+            deterministic=planner_deterministic,
+            debug_collect=planner_debug_collect,
+            debug_topk=planner_debug_topk,
+            debug_max_steps=planner_debug_max_steps,
+            debug_max_samples=planner_debug_max_samples,
         )
         (
             prefix_embeds,
@@ -847,6 +1063,9 @@ def run_executor_inference(
         finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
         fed_len = 1  # already fed BOS
         eos_fill = torch.full((bsz,), eos_id, device=device, dtype=torch.long)
+        
+        # [FIX] Initialize running attention mask for AR generation.
+        cache_attention_mask = prime_mask
 
         for step in range(max_new_tokens):
             next_ids = logits_t.argmax(dim=-1)        # [B]
@@ -862,10 +1081,13 @@ def run_executor_inference(
             next_type = torch.full_like(next_tok, TYPE_ID_TEXT)
             next_embed = model.embed_with_type(next_tok, next_type)
             step_pos = (prefix_true_len + fed_len).unsqueeze(1)  # [B, 1]
+            
+            # [FIX] Update attention mask to include the new token.
+            cache_attention_mask = torch.cat([cache_attention_mask, ones_step], dim=1)
 
             out = model.forward_backbone(
                 inputs_embeds=next_embed,
-                attention_mask=ones_step,
+                attention_mask=cache_attention_mask,
                 position_ids=step_pos,
                 past_key_values=past_kv,
                 use_cache=True,

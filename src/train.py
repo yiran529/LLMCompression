@@ -447,6 +447,8 @@ def train():
             for p in trainable_with_grad:
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=1e4, neginf=-1e4)
                 p.grad.clamp_(-5.0, 5.0)
+            # 注意：clip_grad_norm_ 返回的是触发裁剪时的缩放前全局范数（用于监控）。
+            # 但参数梯度 p.grad 会被原地缩放到 max_norm 约束内，并用于后续 optimizer.step()。
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_with_grad, max_norm=1.0)
 
             did_step = False
@@ -473,7 +475,7 @@ def train():
                 tokens_since_last_step = 0
                 step_timer_start = time.perf_counter()
 
-                if global_step % log_every == 0:
+                if global_step % log_every == 1:
                     recent = epoch_losses[-min(log_every, len(epoch_losses)) :]
                     avg_loss = sum(recent) / max(1, len(recent))
                     avg_lens = []
