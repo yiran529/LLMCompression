@@ -227,9 +227,10 @@ class PlannerOutput:
     quota_count: torch.Tensor
 
 class PlannerQuotaController:
-    def __init__(self, *, tau: float, eta: float, lambda_init: float, device: str):
+    def __init__(self, *, tau: float, eta: float, lambda_init: float, lambda_max: float, device: str):
         self.tau = float(tau)
         self.eta = float(eta)
+        self.lambda_max = float(lambda_max)
         self.lambda_value = torch.tensor(lambda_init, device=device, dtype=torch.float32)
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
@@ -247,7 +248,7 @@ class PlannerQuotaController:
         loss_quota = self.lambda_value.detach() * F.relu(bar_m - self.tau)
         with torch.no_grad():
             new_lambda = self.lambda_value + self.eta * (bar_m.detach() - self.tau)
-            self.lambda_value = torch.clamp(new_lambda, min=0.0)
+            self.lambda_value = torch.clamp(new_lambda, min=0.0, max=self.lambda_max)
         return loss_quota, bar_m
 
 def compute_planner_quota_loss(

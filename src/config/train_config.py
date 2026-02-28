@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import os
 import random
 from dataclasses import dataclass
@@ -48,9 +48,10 @@ LAMBDA_EOS = 0.2
 LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
 EPS = 1e-8
-QUOTA_TAU = 0.15
-QUOTA_ETA = 0.01
+QUOTA_TAU = 0.2
+QUOTA_ETA = 0.005
 QUOTA_LAMBDA_INIT = 0.0
+QUOTA_LAMBDA_MAX = 2.0
 
 # 0 is reserved for "normal text / neutral type".
 TYPE_ID_TEXT = 0

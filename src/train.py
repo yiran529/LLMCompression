@@ -113,6 +113,7 @@ def train():
         tau=QUOTA_TAU,
         eta=QUOTA_ETA,
         lambda_init=QUOTA_LAMBDA_INIT,
+        lambda_max=QUOTA_LAMBDA_MAX,
         device=device,
     )
     if RESUME_ENABLED:

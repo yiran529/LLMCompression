@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import logging
 import math
 import os
@@ -240,6 +240,7 @@ def _build_wandb_config(
         "quota_tau": QUOTA_TAU,
         "quota_eta": QUOTA_ETA,
         "quota_lambda_init": QUOTA_LAMBDA_INIT,
+        "quota_lambda_max": QUOTA_LAMBDA_MAX,
         "lora_r": LORA_R,
         "lora_alpha": LORA_ALPHA,
         "lora_dropout": LORA_DROPOUT,
@@ -282,7 +283,7 @@ def init_wandb_run(
             new_rows=new_rows,
             device=device,
         ),
-        "mode": "online", #! 暂时先写死online，后续可以通过环境变量WANDB_MODE切换到offline或disabled
+        "mode": "online", #! 鏆傛椂鍏堝啓姝籵nline锛屽悗缁彲浠ラ€氳繃鐜鍙橀噺WANDB_MODE鍒囨崲鍒皁ffline鎴杁isabled
         "save_code": True,
         "dir": OUTPUT_DIR,
         "settings": wandb.Settings(x_stats_sampling_interval=15),
