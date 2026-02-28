@@ -236,11 +236,10 @@ Concept -> Tail    : disallowed
 3. **Executor（展开生成）**
 
    * 条件生成：
-     [
-     x_{1:T} \sim p(x \mid C)
-     ]
-   * Executor **不读取普通 tokens 前缀作为条件上下文**
+     x_t ~ p(x_t​∣C,x_{ < t} ​)
+   * Executor **不读取普通 tokens 输入前缀作为条件上下文**
    * 普通 token 按标准自回归生成，支持 KV cache。
+   * 会把已生成普通 tokens 作为“条件上下文”再输入模型
 
 ---
 
@@ -281,6 +280,72 @@ Goal: Two-stage **Planner–Executor Concept-first Decoding**. Concept tokens ar
      ]
    * The Executor conditions **only on concept tokens** (no normal-token prefix as input).
    * Standard autoregressive decoding with KV cache.
+
+### 上下文
+#### A
+我提出了一个LLM推理加速的方案：先用LLM将输入自回归压缩到少量的离散concept tokens组成的序列中（来自一个新的词表），再用同一个LLM将concept tokens序列自回归生成输出。简要总结我这个方法，确保你理解了我的方案的细节，后续对话将在此基础上进行。一些更具体的细节如下: ……（将前面的中文prompt粘贴上来）
+#### B
+通过分析你提供的代码（`model.py`、`train.py`、`infer.py` 等），我为你总结了这个项目的模型架构与训练流程。这是一个**基于“概念规划（Planner）- 执行（Executor）”两阶段生成框架**的 Token 压缩/受控生成模型。
+
+##### 1. 核心模型架构 (`SharedBackboneUnifiedHead`)
+
+该模型旨在通过**共享骨干网络**（Shared Backbone）同时完成“概念规划”和“文本生成”两个任务。
+
+*   **基础骨干 (Backbone)**:
+    *   使用一个预训练的因果语言模型（`AutoModelForCausalLM`）作为特征提取器。
+    *   集成了 **LoRA (Low-Rank Adaptation)** 进行参数高效微调，大部分基础参数被冻结，只训练 LoRA 权重。
+*   **统一嵌入层 (Unified Embeddings)**:
+    *   **Token Embedding**: 分为 `base`（原模型词表）和 `new`（新增的概念 Token）。
+    *   **Type Embedding**: 引入了 `type_embed`，用于区分当前是在处理普通文本、还是某种特定类型的概念（如 `ConceptTypeConfig` 定义的多种类型）。
+    *   输入最终是 `Token Embedding + Type Embedding`。
+*   **统一输出头 (Unified Output Head)**:
+    *   **Base Head**: 映射回原词表大小，用于生成普通文本。
+    *   **New Head**: 映射到新增的概念词表，用于生成概念 Token。
+    *   前向传播时，根据当前任务输出拼接后的 Logits。
+*   **配额控制器 (PlannerQuotaController)**:
+    *   用于在规划阶段动态调节生成的“配额”（Quota），控制生成数量或分布。
+
+##### 2. 训练流程 (两阶段训练)
+
+训练在一个 Step 中分两个阶段进行，两个阶段共享梯度更新。
+
+###### 第一阶段：规划器 (Planner Stage)
+**目标**：根据输入文本，生成一系列高层的“概念”Token。这是一个**自回归生成的**过程，但在训练时是在线生成的。
+
+1.  **构建 Prompt**: `[BOS, input_ids, <PLAN>]`。模型看到 `<PLAN>` 后开始生成概念。
+2.  **异步概念生成 (`plan_concepts`)**:
+    *   模型并行地为定义好的多种 `ConceptType` 生成序列。
+    *   **机制**：使用 Gumbel-Softmax 进行**可微采样**（Soft/Hard 结合），使得后续的执行器可以通过梯度回传优化规划器。
+    *   **约束**：
+        *   `commitment_loss`: 约束软采样（Gumbel Softmax 输出）和硬采样（One-hot）的一致性。
+        *   `usage_kl_to_uniform`: 防止概念坍缩（Concept Collapse），鼓励多样性。
+        *   `loss_eos`: 鼓励模型适时生成 EOS，控制概念序列长度。
+        *   `loss_quota`: 通过配额控制器约束生成的总量。
+3.  **输出**: 得到每个类型的概念序列（Hard ID 用于构建 Prompt，Soft Embeddings 用于可能的梯度流或分析）。
+
+###### 第二阶段：执行器 (Executor / BPTT Stage)
+**目标**：基于规划器生成的概念序列作为前缀（Prefix），重建/生成原始文本。
+
+1.  **构建执行前缀 (`build_executor_prefix`)**:
+    *   将第一阶段生成的概念序列（包括 Type ID、Position ID 等）拼接起来。
+    *   结构：`[Concept_Type_1..., Concept_Type_2..., BOS]`。
+2.  **前向传播与计算 Loss**:
+    *   **输入**: `[Executor Prefix, BOS, input_ids]`
+    *   **目标**: 预测 `input_ids`（Next Token Prediction）。
+    *   **Mask**: 执行器通过 Attention Mask 可以看到所有的概念前缀，但概念前缀内部是基于 Causal Mask 或特定可见性设置的。
+    *   **Loss**: 标准的 CrossEntropyLoss，衡量在给定概念规划下恢复原文本的能力。
+
+##### 3. 数据流总结
+
+1.  **Input Text** -> **Backbone** -> **<PLAN>** -> **Planner Generation (Gumbel Softmax)** -> **Concept Tokens**.
+2.  **Concept Tokens (作为 Prefix)** + **Input Text** -> **Backbone** -> **Text Reconstruction Loss**.
+
+##### 关键点总结
+*   **端到端可微**：通过 Gumbel-Softmax 或类似的直通估计（Straight-Through Estimator），让执行器的 Loss 可以更新规划器的参数，使模型学会生成“有利于还原文本”的概念。
+*   **多类型概念**：支持多种不同属性的概念（由 `metas` 定义），模型会按顺序或并行规划这些不同层级的压缩表示。
+*   **LoRA 微调**：保证了训练效率，主要调整的是 LoRA 参数和新增的 Head/Embedding 参数。
+
+这个架构非常适合**文本压缩**、**受控生成**或**长文本建模**（通过高层概念减少序列长度）任务。我已完全理解该架构。
 
 ## v3.1: speed up training
 1. 预测concept tokens时MTP （有点类似于AR结合query）
@@ -435,3 +500,14 @@ g = S(z^**{\text{new}})-S(z^**{\text{old}})
 * flip 很早变 0 + 熵很低：提高温度/熵正则；用 diverse beam；偶尔强制探索（采样候选）
 * staleness gap 大：缩短 E-step 更新间隔或用自适应更新；减 LR
 * cos(e_soft,e_hard) 长期低：降温度或 anneal；对 soft 加 sharpen（但别一下子太硬）
+
+
+
+-----
+
+
+# position_ids设计
+
+# bugs:
+* padding tokens 也计入position_ids的递增
+* concept tokens貌似没有PAD，只有EOS

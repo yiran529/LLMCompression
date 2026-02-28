@@ -416,6 +416,12 @@ def plan_concepts(
     quota_mass_sum = torch.zeros((), device=device, dtype=torch.float32)
     quota_count = torch.zeros((), device=device, dtype=torch.float32)
 
+    # [FIX] Initialize running attention mask and position IDs for autoregressive generation.
+    # The mask must cover [Prompt + Past_Generated], not just the current step.
+    # The position IDs should ideally be continuous for RoPE-based models to maintain relative distance to the prompt.
+    cache_attention_mask = planner_mask
+    cache_position_ids = planner_pos[:, -1:].clone() + 1
+
     # ---------------------------------------------------------------------
     # 5) Main asynchronous decoding loop.
     # One loop iteration emits exactly one token per active sample.
@@ -565,10 +571,23 @@ def plan_concepts(
 
         # Straight-through one-step input to advance shared KV cache.
         st_embed = hard_embed_step + (soft_embed_step - soft_embed_step.detach())  # [B, H]
+
+        # [FIX] Update attention mask and position IDs for the next step.
+        # AR generation requires position IDs to increase monotonically to maintain RoPE relative distances,
+        # unless specific "restart" semantics are intended. Given concepts are generated sequentially, 
+        # continuous position IDs are safer to avoid attention anomalies.
+        # We ignore the per-type `step_pos` reset logic for the BACKBONE forward pass to keep the LM context valid.
+        
+        cache_attention_mask = torch.cat(
+            [cache_attention_mask, torch.ones((bsz, 1), device=device, dtype=torch.long)],
+            dim=1
+        )
+        cache_position_ids = cache_position_ids + 1
+
         out_next = model.forward_backbone(
             inputs_embeds=st_embed.unsqueeze(1),  # [B, 1, H]
-            attention_mask=ones_step,             # [B, 1]
-            position_ids=step_pos,                # [B, 1]
+            attention_mask=cache_attention_mask,  # [B, T_curr]
+            position_ids=cache_position_ids,      # [B, 1]
             past_key_values=past_kv,
             use_cache=True,
         )
@@ -847,6 +866,9 @@ def run_executor_inference(
         finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
         fed_len = 1  # already fed BOS
         eos_fill = torch.full((bsz,), eos_id, device=device, dtype=torch.long)
+        
+        # [FIX] Initialize running attention mask for AR generation.
+        cache_attention_mask = prime_mask
 
         for step in range(max_new_tokens):
             next_ids = logits_t.argmax(dim=-1)        # [B]
@@ -863,9 +885,13 @@ def run_executor_inference(
             next_embed = model.embed_with_type(next_tok, next_type)
             step_pos = (prefix_true_len + fed_len).unsqueeze(1)  # [B, 1]
 
+            
+            # [FIX] Update attention mask to include the new token.
+            cache_attention_mask = torch.cat([cache_attention_mask, ones_step], dim=1)
+
             out = model.forward_backbone(
                 inputs_embeds=next_embed,
-                attention_mask=ones_step,
+                attention_mask=cache_attention_mask,
                 position_ids=step_pos,
                 past_key_values=past_kv,
                 use_cache=True,
