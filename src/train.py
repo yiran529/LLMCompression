@@ -295,6 +295,7 @@ def train():
 
     global_step = resume_step
     log_every = max(1, LOG_STEPS)
+    eval_every = max(0, int(EVAL_STEPS))
     for epoch in range(EPOCHS):
         epoch_losses: List[float] = []
         optimizer.zero_grad(set_to_none=True)
@@ -521,6 +522,22 @@ def train():
                         step_tokens=step_tokens,
                         scaler=scaler,
                         stage_metrics=stage_metrics,
+                    )
+
+                if eval_every > 0 and global_step % eval_every == 0:
+                    run_periodic_eval(
+                        model=model,
+                        tokenizer=tokenizer,
+                        metas=metas,
+                        mask_cache=mask_cache,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        plan_token_id=plan_token_id,
+                        bos_id=bos_id,
+                        eos_id=eos_id,
+                        device=device,
+                        global_step=global_step,
+                        wandb_run=wandb_run,
                     )
 
                 if global_step % SAVE_STEPS == 0:

@@ -309,6 +309,7 @@ def plan_concepts(
     min_concept_steps: int,
     base_vocab_size: int,
     device: str,
+    sampling_mode: str = "gumbel",
 ) -> PlannerOutput:
     """generate one variable-length concept sequence per type from source input."""
     bsz, _ = input_ids.shape
@@ -469,9 +470,17 @@ def plan_concepts(
                 forced[:, eos_t] = 0.0
                 masked_logits[force_mask] = forced
 
-        # Straight-through categorical sample from constrained logits.
-        probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
-        sampled_ids = probs.argmax(dim=-1)  # [B]
+        # Select planner token with either stochastic Gumbel-ST (train) or deterministic greedy (infer).
+        if sampling_mode == "gumbel":
+            probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
+            sampled_ids = probs.argmax(dim=-1)  # [B]
+        elif sampling_mode == "greedy":
+            probs = F.softmax(masked_logits, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+            sampled_ids = masked_logits.argmax(dim=-1)  # [B]
+        else:
+            raise ValueError(f"Unsupported sampling_mode: {sampling_mode}. Use 'gumbel' or 'greedy'.")
         # Keep inactive rows deterministic.
         sampled_ids = torch.where(
             active,
@@ -817,6 +826,7 @@ def run_executor_inference(
             metas=metas,
             mask_cache=mask_cache,
             tau=planner_tau,
+            sampling_mode="greedy",
             min_concept_steps=min_concept_steps,
             base_vocab_size=model.base_vocab_size,
             device=device,

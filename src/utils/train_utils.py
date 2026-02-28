@@ -219,6 +219,10 @@ def _build_wandb_config(
         "max_input_tokens": MAX_INPUT_TOKENS,
         "save_steps": SAVE_STEPS,
         "log_steps": LOG_STEPS,
+        "eval_steps": EVAL_STEPS,
+        "eval_num_samples": EVAL_NUM_SAMPLES,
+        "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
+        "eval_planner_tau": EVAL_PLANNER_TAU,
         "seed": SEED,
         "model_dtype": MODEL_DTYPE,
         "attention_impl": ATTENTION_IMPL,
@@ -411,3 +415,110 @@ def cuda_stage_end(stage_name: str, state: Optional[Dict[str, float]]) -> Dict[s
         f"gpu/{stage_name}_reserved_delta_mb": _to_mb(int(reserved1 - state["reserved0"])),
     }
 
+# ============================================================
+# Eval utilities
+# ============================================================
+
+def _trim_to_first_eos(token_ids: List[int], eos_id: int) -> List[int]:
+    if eos_id in token_ids:
+        return token_ids[: token_ids.index(eos_id)]
+    return token_ids
+
+
+def _format_concepts_for_sample(
+    tokenizer: AutoTokenizer,
+    metas: List[ConceptTypeMeta],
+    planner_out: PlannerOutput,
+    sample_idx: int,
+) -> List[str]:
+    lines: List[str] = []
+    for meta, type_out in zip(metas, planner_out.per_type):
+        valid = type_out.valid_mask[sample_idx].to(torch.bool)
+        ids = type_out.token_ids[sample_idx][valid].tolist()
+        toks = tokenizer.convert_ids_to_tokens(ids)
+        tok_text = " ".join(toks) if toks else "(empty)"
+        lines.append(f"{meta.name}: ids={ids} tokens={tok_text}")
+    return lines
+
+
+def run_periodic_eval(
+    *,
+    model: SharedBackboneUnifiedHead,
+    tokenizer: AutoTokenizer,
+    metas: List[ConceptTypeMeta],
+    mask_cache: ConceptMaskCache,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    plan_token_id: int,
+    bos_id: int,
+    eos_id: int,
+    device: str,
+    global_step: int,
+    wandb_run,
+) -> None:
+    sample_count = min(int(EVAL_NUM_SAMPLES), int(input_ids.size(0)))
+    if sample_count <= 0:
+        return
+
+    eval_input_ids = input_ids[:sample_count]
+    eval_attention_mask = attention_mask[:sample_count]
+    infer_out = run_executor_inference(
+        model,
+        input_ids=eval_input_ids,
+        attention_mask=eval_attention_mask,
+        plan_token_id=plan_token_id,
+        bos_id=bos_id,
+        eos_id=eos_id,
+        metas=metas,
+        mask_cache=mask_cache,
+        device=device,
+        max_new_tokens=EVAL_MAX_NEW_TOKENS,
+        planner_tau=EVAL_PLANNER_TAU,
+        min_concept_steps=MIN_CONCEPT_STEPS,
+    )
+
+    rows = []
+    for i in range(sample_count):
+        src_len = int(eval_attention_mask[i].sum().item())
+        src_ids = eval_input_ids[i, :src_len].tolist()
+        src_text = tokenizer.decode(src_ids, skip_special_tokens=EVAL_SKIP_SPECIAL_TOKENS)
+
+        gen_len = int(infer_out.lengths[i].item())
+        gen_ids = infer_out.generated_ids[i, :gen_len].tolist()
+        gen_ids = _trim_to_first_eos(gen_ids, eos_id)
+        out_text = tokenizer.decode(gen_ids, skip_special_tokens=EVAL_SKIP_SPECIAL_TOKENS)
+
+        concept_lines = _format_concepts_for_sample(
+            tokenizer=tokenizer,
+            metas=metas,
+            planner_out=infer_out.planner_out,
+            sample_idx=i,
+        )
+        concept_text = "\n".join(concept_lines)
+
+        logging.info("=" * 100)
+        logging.info(f"[Eval Step {global_step}] Sample {i}")
+        logging.info(f"Input: {src_text}")
+        logging.info("Concepts:")
+        for line in concept_lines:
+            logging.info(f"  {line}")
+        logging.info(f"Output: {out_text}")
+
+        rows.append([int(global_step), int(i), src_text, concept_text, out_text])
+
+    if wandb_run is not None:
+        try:
+            import wandb  # type: ignore
+            table = wandb.Table(
+                columns=["step", "sample_idx", "input", "concept_sequence", "output"],
+                data=rows,
+            )
+            wandb_run.log(
+                {
+                    "eval/samples": table,
+                    "eval/num_samples": float(sample_count),
+                },
+                step=global_step,
+            )
+        except Exception as e:
+            logging.warning(f"[WARN] failed to log eval samples to wandb: {e}")
