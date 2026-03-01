@@ -151,10 +151,18 @@ def train():
     for name, param in model.named_parameters():
         if not param.requires_grad or param.dtype == torch.float32:
             continue
+        
+        # Ensure all trainable params (LoRA, heads, embeddings) are cast to FP32 for GradScaler stability.
+        # "lora_only" implicitly includes other new trainable modules like output_head/token_embed.
+        should_cast = False
         if FP32_TRAINABLE == "all":
-            param.data = param.data.float()
-            fp32_casted += 1
-        elif FP32_TRAINABLE == "lora_only" and "lora" in name.lower():
+            should_cast = True
+        elif FP32_TRAINABLE == "lora_only":
+            conditions = ["lora", "output_head", "token_embed", "type_embed"]
+            if any(k in name.lower() for k in conditions):
+                should_cast = True
+
+        if should_cast:
             param.data = param.data.float()
             fp32_casted += 1
     if fp32_casted > 0:
@@ -475,7 +483,7 @@ def train():
                 tokens_since_last_step = 0
                 step_timer_start = time.perf_counter()
 
-                if global_step % log_every == 0:
+                if global_step % log_every == 1:
                     recent = epoch_losses[-min(log_every, len(epoch_losses)) :]
                     avg_loss = sum(recent) / max(1, len(recent))
                     avg_lens = []

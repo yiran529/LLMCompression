@@ -171,9 +171,11 @@ class SharedBackboneUnifiedHead(nn.Module):
         )
         is_base = flat_ids < self.base_vocab_size
         if torch.any(is_base):
-            out[is_base] = self.token_embed_base(flat_ids[is_base])
+            out[is_base] = self.token_embed_base(flat_ids[is_base]).to(dtype=out.dtype)
         if torch.any(~is_base):
-            out[~is_base] = self.token_embed_new(flat_ids[~is_base] - self.base_vocab_size)
+            out[~is_base] = self.token_embed_new(flat_ids[~is_base] - self.base_vocab_size).to(
+                dtype=out.dtype
+            )
         return out.view(*token_ids.shape, self.hidden_size)
 
     def get_new_token_embed_weight(self) -> torch.Tensor:
