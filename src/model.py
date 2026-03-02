@@ -634,8 +634,13 @@ def plan_concepts(
         loss_commit = loss_commit + commit_sum1[t] / denom + BETA_COMMIT * (commit_sum2[t] / denom)
 
         hist = hist_sum[t]
-        hist = hist / (hist.sum() + EPS)
-        loss_unif = loss_unif + usage_kl_to_uniform(hist)
+        # When planner emits no concept token for this type, `hist.sum()==0`.
+        # Normalizing by tiny EPS amplifies gradients (~1/EPS), which can
+        # cause finite loss but non-finite gradients. Skip uniform KL in that case.
+        hist_total = hist.sum()
+        if float(hist_total.detach().item()) > 0.0:
+            hist = hist / hist_total.clamp_min(1.0)
+            loss_unif = loss_unif + usage_kl_to_uniform(hist)
 
         denom_eos = eos_count[t].clamp_min(1.0)
         loss_eos = loss_eos + eos_sum[t] / denom_eos

@@ -448,7 +448,10 @@ def train():
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
 
-            trainable_with_grad = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+            trainable_named_with_grad = [
+                (name, p) for name, p in model.named_parameters() if p.requires_grad and p.grad is not None
+            ]
+            trainable_with_grad = [p for _, p in trainable_named_with_grad]
             if not trainable_with_grad:
                 if scaler is not None and scaler.is_enabled():
                     scaler.update()
@@ -459,12 +462,31 @@ def train():
                 continue
 
             has_non_finite_grad = False
-            for p in trainable_with_grad:
+            bad_grad_name = ""
+            bad_grad_ref = None
+            for name, p in trainable_named_with_grad:
                 if not torch.isfinite(p.grad).all():
                     has_non_finite_grad = True
+                    bad_grad_name = name
+                    bad_grad_ref = p.grad
                     break
             if has_non_finite_grad:
-                logging.warning("[WARN] non-finite gradients detected, skip optimizer step")
+                scale_info = ""
+                if scaler is not None and scaler.is_enabled():
+                    scale_info = f", grad_scale={float(scaler.get_scale()):.1f}"
+                detail = ""
+                if bad_grad_ref is not None:
+                    grad_view = bad_grad_ref.detach()
+                    if grad_view.is_sparse:
+                        grad_view = grad_view.coalesce().values()
+                    finite_mask = torch.isfinite(grad_view)
+                    finite_ratio = float(finite_mask.float().mean().item())
+                    grad_abs_max = float(torch.nan_to_num(grad_view.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
+                    detail = (
+                        f" first_bad_param={bad_grad_name}, "
+                        f"finite_ratio={finite_ratio:.6f}, grad_abs_max={grad_abs_max:.4e}"
+                    )
+                logging.warning(f"[WARN] non-finite gradients detected, skip optimizer step{scale_info}{detail}")
                 if scaler is not None and scaler.is_enabled():
                     scaler.update()
                 optimizer.zero_grad(set_to_none=True)

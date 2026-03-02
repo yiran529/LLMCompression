@@ -22,7 +22,7 @@ BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 36
+BATCH_SIZE = 40
 GRAD_ACCUM = 8
 EPOCHS = 3
 LR = 1e-4
