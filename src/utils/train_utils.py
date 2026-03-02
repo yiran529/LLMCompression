@@ -456,27 +456,41 @@ def run_periodic_eval(
     device: str,
     global_step: int,
     wandb_run,
+    model_dtype: torch.dtype = torch.float32,
+    use_amp: bool = False,
 ) -> None:
     sample_count = min(int(EVAL_NUM_SAMPLES), int(input_ids.size(0)))
     if sample_count <= 0:
         return
 
+    # Save training state and switch to eval mode
+    was_training = model.training
+    model.eval()
+
     eval_input_ids = input_ids[:sample_count]
     eval_attention_mask = attention_mask[:sample_count]
-    infer_out = run_executor_inference(
-        model,
-        input_ids=eval_input_ids,
-        attention_mask=eval_attention_mask,
-        plan_token_id=plan_token_id,
-        bos_id=bos_id,
-        eos_id=eos_id,
-        metas=metas,
-        mask_cache=mask_cache,
-        device=device,
-        max_new_tokens=EVAL_MAX_NEW_TOKENS,
-        planner_tau=EVAL_PLANNER_TAU,
-        min_concept_steps=MIN_CONCEPT_STEPS,
-    )
+    
+    # Run inference without gradients and with proper autocast
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
+            infer_out = run_executor_inference(
+                model,
+                input_ids=eval_input_ids,
+                attention_mask=eval_attention_mask,
+                plan_token_id=plan_token_id,
+                bos_id=bos_id,
+                eos_id=eos_id,
+                metas=metas,
+                mask_cache=mask_cache,
+                device=device,
+                max_new_tokens=EVAL_MAX_NEW_TOKENS,
+                planner_tau=EVAL_PLANNER_TAU,
+                min_concept_steps=MIN_CONCEPT_STEPS,
+            )
+
+    # Restore training state
+    if was_training:
+        model.train()
 
     rows = []
     for i in range(sample_count):

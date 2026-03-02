@@ -547,6 +547,8 @@ def train():
                         device=device,
                         global_step=global_step,
                         wandb_run=wandb_run,
+                        model_dtype=model_dtype,
+                        use_amp=use_amp,
                     )
 
                 if global_step % SAVE_STEPS == 0:
