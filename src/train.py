@@ -295,6 +295,7 @@ def train():
     # =========================
     # 11) Training loop with two-stage forward, logging, wandb metrics, and checkpointing
     # =========================
+    # ---- [Init] training loop state / progress bar ----
     model.train()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -306,16 +307,19 @@ def train():
     log_every = max(1, LOG_STEPS)
     eval_every = max(0, int(EVAL_STEPS))
     for epoch in range(EPOCHS):
+        # ---- [Epoch] reset per-epoch counters ----
         epoch_losses: List[float] = []
         optimizer.zero_grad(set_to_none=True)
         tokens_since_last_step = 0
         step_timer_start = time.perf_counter()
 
+        # ---- [Epoch] init async prefetcher ----
         micro_step = 0
         prefetcher = CUDAPrefetcher(dataloader, device=device)
         batch = prefetcher.next()
 
         while batch is not None:
+            # ---- [Batch] load tensors + decide profiling ----
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
             tokens_since_last_step += int(attention_mask.sum().item())
@@ -328,9 +332,10 @@ def train():
             profile_cuda = should_profile_step and torch.cuda.is_available()
             stage_metrics: Dict[str, float] = {}
 
+            # ---- [Forward] planner + executor in AMP autocast ----
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
+                # [Planner] source text -> typed concept sequences.
                 planner_stage_state = cuda_stage_begin(profile_cuda)
-                # Stage 1 (Planner): source text -> typed concept sequences.
                 (
                     planner_out,
                     loss_commit,
@@ -352,8 +357,8 @@ def train():
                 )
                 stage_metrics.update(cuda_stage_end("planner", planner_stage_state))
 
+                # [Executor] concept prefix + AR reconstruction.
                 execute_stage_state = cuda_stage_begin(profile_cuda)
-                # Build concept-only prefix for Stage 2.
                 (
                     prefix_embeds,
                     prefix_mask,
@@ -423,12 +428,14 @@ def train():
                 ).float()
                 stage_metrics.update(cuda_stage_end("execute", execute_stage_state))
 
+            # ---- [Guard] skip invalid loss early ----
             if not torch.isfinite(loss):
                 logging.warning("[WARN] non-finite loss, skip batch")
                 optimizer.zero_grad(set_to_none=True)
                 batch = prefetcher.next()
                 continue
 
+            # ---- [Backward] gradient accumulation backward ----
             bptt_stage_state = cuda_stage_begin(profile_cuda)
             loss_scaled = loss / GRAD_ACCUM
             if scaler is not None and scaler.is_enabled():
@@ -440,14 +447,17 @@ def train():
             micro_step += 1
             is_last_in_epoch = prefetcher.next_batch is None
             do_step = (micro_step % GRAD_ACCUM == 0) or is_last_in_epoch
+            # ---- [Accum] only step optimizer on accumulation boundary ----
             if not do_step:
                 batch = prefetcher.next()
                 continue
 
+            # ---- [Optim] unscale grads before grad checks / clipping ----
             optim_stage_state = cuda_stage_begin(profile_cuda)
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
 
+            # ---- [Guard] collect trainable params with valid grads ----
             trainable_named_with_grad = [
                 (name, p) for name, p in model.named_parameters() if p.requires_grad and p.grad is not None
             ]
@@ -461,6 +471,7 @@ def train():
                 batch = prefetcher.next()
                 continue
 
+            # ---- [Guard] skip step if any grad is NaN/Inf ----
             has_non_finite_grad = False
             bad_grad_name = ""
             bad_grad_ref = None
@@ -494,6 +505,8 @@ def train():
                 step_timer_start = time.perf_counter()
                 batch = prefetcher.next()
                 continue
+
+            # ---- [Optim] clip grad norm + optimizer step ----
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_with_grad, max_norm=1.0)
 
             did_step = False
@@ -512,6 +525,7 @@ def train():
 
             optimizer.zero_grad(set_to_none=True)
 
+            # ---- [Step] scheduler / throughput / logging / wandb ----
             if did_step:
                 scheduler.step()
                 global_step += 1
@@ -572,6 +586,7 @@ def train():
                         stage_metrics=stage_metrics,
                     )
 
+                # ---- [Step] periodic eval and checkpoint ----
                 if eval_every > 0 and global_step % eval_every == 0:
                     run_periodic_eval(
                         model=model,
@@ -605,6 +620,7 @@ def train():
                 tokens_since_last_step = 0
                 step_timer_start = time.perf_counter()
 
+            # ---- [UI] progress bar + ETA ----
             progress_bar.update(1)
             elapsed = time.time() - start_time
             done = progress_bar.n
@@ -616,6 +632,7 @@ def train():
 
             batch = prefetcher.next()
 
+    # ---- [Finalize] final checkpoint after all epochs ----
     total_seconds = int(time.time() - start_time)
     total_time = timedelta(seconds=total_seconds)
     logging.info(f"[DONE] training complete, total time: {total_time}")
