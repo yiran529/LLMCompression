@@ -12,46 +12,46 @@ COMPILE_MODE = "reduce-overhead"
 
 # A800-friendly defaults
 # MODEL_DTYPE: "bf16" (recommended), "fp16", "fp32"
-MODEL_DTYPE = "bf16"
+MODEL_DTYPE = "fp16"
 # ATTENTION_IMPL: "flash_attention_2", "sdpa", "eager", or "" to let HF decide
-ATTENTION_IMPL = "flash_attention_2"
+ATTENTION_IMPL = "sdpa"
 # FP32_TRAINABLE: "none", "lora_only", "all"
-FP32_TRAINABLE = "none"
+FP32_TRAINABLE = "lora_only"
 
-BASE_DIR = "./qwen3-0.6b"
+BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 36
 GRAD_ACCUM = 8
 EPOCHS = 3
-LR = 5e-4
-WARMUP_RATIO = 0.05
-MAX_INPUT_TOKENS = 64
+LR = 1e-4
+WARMUP_RATIO = 0.1
+MAX_INPUT_TOKENS = 32
 SEED = 42
 SAVE_STEPS = 200
 LOG_STEPS = 5
 EVAL_STEPS = 100
 EVAL_NUM_SAMPLES = 4
-EVAL_MAX_NEW_TOKENS = 64
+EVAL_MAX_NEW_TOKENS = 32
 EVAL_PLANNER_TAU = 0.2
 EVAL_SKIP_SPECIAL_TOKENS = True
 
-TAU_INIT = 0.8
-TAU_MIN = 0.2
+TAU_INIT = 1.0
+TAU_MIN = 0.5
 MIN_CONCEPT_STEPS = 1
 
 LAMBDA_REC = 1.0
-LAMBDA_COMMIT = 0.5
-LAMBDA_UNIF = 0.2
-LAMBDA_EOS = 0.2
+LAMBDA_COMMIT = 0.1
+LAMBDA_UNIF = 0.1
+LAMBDA_EOS = 0.1
 LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
 EPS = 1e-8
-QUOTA_TAU = 0.2
+QUOTA_TAU = 0.4
 QUOTA_ETA = 0.0005  # Reduced from 0.005 to prevent early collapse
 QUOTA_LAMBDA_INIT = 0.0
-QUOTA_LAMBDA_MAX = 2.0
+QUOTA_LAMBDA_MAX = 1.0
 
 # 0 is reserved for "normal text / neutral type".
 TYPE_ID_TEXT = 0
