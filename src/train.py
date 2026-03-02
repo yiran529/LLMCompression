@@ -322,7 +322,9 @@ def train():
 
             tau = get_adaptive_tau(global_step, total_steps, TAU_INIT, TAU_MIN)
             will_do_step = ((micro_step + 1) % GRAD_ACCUM == 0) or (prefetcher.next_batch is None)
-            should_profile_step = will_do_step and ((global_step + 1) % log_every == 0)
+            # Align profiling steps with the later wandb logging condition:
+            # after optimizer step, logs happen when `global_step % log_every == 1`.
+            should_profile_step = will_do_step and (global_step % log_every == 0)
             profile_cuda = should_profile_step and torch.cuda.is_available()
             stage_metrics: Dict[str, float] = {}
 
