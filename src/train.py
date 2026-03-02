@@ -456,9 +456,18 @@ def train():
                 batch = prefetcher.next()
                 continue
 
+            has_non_finite_grad = False
             for p in trainable_with_grad:
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=1e4, neginf=-1e4)
-                p.grad.clamp_(-5.0, 5.0)
+                if not torch.isfinite(p.grad).all():
+                    has_non_finite_grad = True
+                    break
+            if has_non_finite_grad:
+                logging.warning("[WARN] non-finite gradients detected, skip optimizer step")
+                optimizer.zero_grad(set_to_none=True)
+                tokens_since_last_step = 0
+                step_timer_start = time.perf_counter()
+                batch = prefetcher.next()
+                continue
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_with_grad, max_norm=1.0)
 
             did_step = False

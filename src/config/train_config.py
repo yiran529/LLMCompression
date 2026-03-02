@@ -49,7 +49,7 @@ LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
 EPS = 1e-8
 QUOTA_TAU = 0.2
-QUOTA_ETA = 0.005
+QUOTA_ETA = 0.0005  # Reduced from 0.005 to prevent early collapse
 QUOTA_LAMBDA_INIT = 0.0
 QUOTA_LAMBDA_MAX = 2.0
 
