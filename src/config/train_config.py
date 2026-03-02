@@ -85,9 +85,8 @@ class ConceptTypeConfig:
 
 
 CONCEPT_TYPE_CONFIGS = [
-    ConceptTypeConfig(name="bottom", size=2048, max_steps=20, target_ratio=0.23),
-    ConceptTypeConfig(name="mid", size=256, max_steps=8, target_ratio=0.04),
-    ConceptTypeConfig(name="top", size=32, max_steps=4, target_ratio=0.02),
+    ConceptTypeConfig(name="bottom", size=2048, max_steps=10, target_ratio=0.25),
+    ConceptTypeConfig(name="mid", size=256, max_steps=5, target_ratio=0.1),
 ]
 
 

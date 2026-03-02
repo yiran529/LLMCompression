@@ -450,6 +450,8 @@ def train():
 
             trainable_with_grad = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
             if not trainable_with_grad:
+                if scaler is not None and scaler.is_enabled():
+                    scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 tokens_since_last_step = 0
                 step_timer_start = time.perf_counter()
@@ -463,6 +465,8 @@ def train():
                     break
             if has_non_finite_grad:
                 logging.warning("[WARN] non-finite gradients detected, skip optimizer step")
+                if scaler is not None and scaler.is_enabled():
+                    scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 tokens_since_last_step = 0
                 step_timer_start = time.perf_counter()
@@ -480,6 +484,8 @@ def train():
                 did_step = True
             else:
                 logging.warning("[WARN] non-finite grad norm, skip optimizer step")
+                if scaler is not None and scaler.is_enabled():
+                    scaler.update()
             stage_metrics.update(cuda_stage_end("optimizer", optim_stage_state))
 
             optimizer.zero_grad(set_to_none=True)
