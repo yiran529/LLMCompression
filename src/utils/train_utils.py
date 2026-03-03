@@ -232,6 +232,7 @@ def _build_wandb_config(
         "tau_init": TAU_INIT,
         "tau_min": TAU_MIN,
         "min_concept_steps": MIN_CONCEPT_STEPS,
+        "allow_planner_base_tokens": ALLOW_PLANNER_BASE_TOKENS,
         "lambda_rec": LAMBDA_REC,
         "lambda_commit": LAMBDA_COMMIT,
         "lambda_unif": LAMBDA_UNIF,

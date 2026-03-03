@@ -188,6 +188,7 @@ def train():
         base_vocab_size=base_vocab_size,
         blocked_for_executor=blocked_ids,
         device=device,
+        allow_base_tokens=ALLOW_PLANNER_BASE_TOKENS,
     )
     logging.info(f"[INFO] Model and tokenizer initialized. Starting data loading...")
 

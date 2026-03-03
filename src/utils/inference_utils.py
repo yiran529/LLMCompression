@@ -171,6 +171,7 @@ def load_runtime() -> InferenceRuntime:
         base_vocab_size=model.base_vocab_size,
         blocked_for_executor=blocked_ids,
         device=device,
+        allow_base_tokens=ALLOW_PLANNER_BASE_TOKENS,
     )
     model.eval()
 

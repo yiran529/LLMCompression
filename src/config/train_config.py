@@ -40,6 +40,8 @@ EVAL_SKIP_SPECIAL_TOKENS = True
 TAU_INIT = 1.0
 TAU_MIN = 0.5
 MIN_CONCEPT_STEPS = 1
+# 是否允许 Planner 输出 base tokens（原词表 tokens）
+ALLOW_PLANNER_BASE_TOKENS = False
 
 LAMBDA_REC = 1.0
 LAMBDA_COMMIT = 0.1

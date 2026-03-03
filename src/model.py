@@ -56,6 +56,7 @@ class ConceptMaskCache:
         base_vocab_size: int,
         blocked_for_executor: List[int],
         device: str,
+        allow_base_tokens: bool = True,
     ):
         """build reusable per-type planner masks and executor output block mask."""
         # Planner 每个 concept type 都有一张“词表白名单”偏置表。
@@ -65,8 +66,8 @@ class ConceptMaskCache:
         very_neg = -1e4
         for meta in metas:
             bias = torch.full((vocab_size,), very_neg, device=device, dtype=torch.float32)
-            # 允许输出：原词表 token + 该 type 的概念 token + 该 type 的 EOS token。
-            if base_vocab_size > 0:
+            # 允许输出：原词表 token（如果 allow_base_tokens=True）+ 该 type 的概念 token + 该 type 的 EOS token。
+            if base_vocab_size > 0 and allow_base_tokens:
                 bias[:base_vocab_size] = 0.0
             bias[meta.concept_ids_with_eos] = 0.0
             self.allowed_logits_bias[meta.name] = bias
