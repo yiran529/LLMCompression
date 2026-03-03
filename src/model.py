@@ -337,9 +337,12 @@ def plan_concepts(
         ],
         dim=1,
     )
-    planner_pos = torch.arange(
-        planner_input_ids.size(1), device=device, dtype=torch.long
-    ).unsqueeze(0).expand(bsz, -1)
+    # Use cumsum on mask to determine real positions, skipping padded regions.
+    # This ensures <PLAN> immediately follows the last valid text token,
+    # avoiding "long-distance" gaps caused by right-padding.
+    planner_pos = torch.cumsum(planner_mask, dim=1) - 1
+    # Ensure non-negative positions (padding positions might get duplicate/garbage values, masked anyway)
+    planner_pos = planner_pos.clamp(min=0)
 
     # Prime the KV cache with the full planner prompt.
     # logits_t is the next-token distribution after consuming prompt.
@@ -683,7 +686,6 @@ def build_executor_prefix(
     token_chunks: List[torch.Tensor] = []
     type_chunks: List[torch.Tensor] = []
     mask_chunks: List[torch.Tensor] = []
-    pos_chunks: List[torch.Tensor] = []
     embed_chunks: List[torch.Tensor] = []
 
     # Block 0: BOS-only prefix.
@@ -693,7 +695,6 @@ def build_executor_prefix(
     token_chunks.append(bos)
     type_chunks.append(bos_type)
     mask_chunks.append(torch.ones((bsz, 1), device=device, dtype=torch.long))
-    pos_chunks.append(torch.zeros((bsz, 1), device=device, dtype=torch.long))
     embed_chunks.append(model.embed_with_type(bos, bos_type))
 
     # Blocks 1..T: append each concept-type segment from planner output.
@@ -721,21 +722,18 @@ def build_executor_prefix(
             # Fallback to standard token+type embedding if ST embeds are absent.
             embed_chunks.append(model.embed_with_type(tok, typ))
         # Critical rule: position indices restart from 1 for each type block.
-        # pos block shape: [B, max_len].
-        pos_chunks.append(
-            torch.arange(1, max_len + 1, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-        )
-
     # Concatenate all prefix blocks into final executor inputs.
     # prefix_token_ids/prefix_type_ids/prefix_mask/prefix_pos: [B, Lp]
     # prefix_embeds: [B, Lp, H]
     prefix_token_ids = torch.cat(token_chunks, dim=1)
     prefix_type_ids = torch.cat(type_chunks, dim=1)
     prefix_mask = torch.cat(mask_chunks, dim=1)
-    prefix_pos = torch.cat(pos_chunks, dim=1)
     prefix_embeds = torch.cat(embed_chunks, dim=1)
+    # [FIX] Use continuous positions to align with planner's AR logic, matching valid tokens only.
+    # BOS (start) gets pos=0. Padding regions repeat the last valid position (masked out anyway).
+    prefix_pos = torch.cumsum(prefix_mask, dim=1) - 1
+    prefix_pos = prefix_pos.clamp(min=0).to(torch.long)
+
     return prefix_embeds, prefix_mask, prefix_pos, prefix_token_ids, prefix_type_ids
 
 def build_decoder_tensors(

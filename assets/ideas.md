@@ -511,3 +511,8 @@ g = S(z^**{\text{new}})-S(z^**{\text{old}})
 # bugs:
 * padding tokens 也计入position_ids的递增
 * concept tokens貌似没有PAD，只有EOS
+
+
+# debug
+1. 不用base tokens
+2. 究竟能不能看到输入
