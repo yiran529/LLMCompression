@@ -340,6 +340,13 @@ def train():
             stage_metrics: Dict[str, float] = {}
             tf_mask_target_ratio = 0.0
             tf_mask_applied_ratio = 0.0
+            planner_mix_greedy_ratio = 0.0
+            planner_mix_greedy_ratio = get_planner_mix_greedy_ratio(
+                global_step=global_step,
+                total_steps=total_steps,
+                ratio_min=TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN,
+                ratio_max=TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX,
+            ) if TRAIN_PLANNER_SAMPLING_MODE == "mix" else 0.0
 
             # ---- [Forward] planner + executor in AMP autocast ----
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
@@ -360,6 +367,8 @@ def train():
                     meta=meta,
                     mask_cache=mask_cache,
                     tau=tau,
+                    sampling_mode=TRAIN_PLANNER_SAMPLING_MODE,
+                    mix_greedy_ratio=planner_mix_greedy_ratio,
                     min_concept_steps=MIN_CONCEPT_STEPS,
                     base_vocab_size=base_vocab_size,
                     device=device,
@@ -585,6 +594,8 @@ def train():
                     if ENABLE_STAGE2_TF_MASKING:
                         step_extra_metrics["train/stage2_tf_mask_ratio_target"] = tf_mask_target_ratio
                         step_extra_metrics["train/stage2_tf_mask_ratio_applied"] = tf_mask_applied_ratio
+                    if TRAIN_PLANNER_SAMPLING_MODE == "mix":
+                        step_extra_metrics["train/planner_mix_greedy_ratio"] = planner_mix_greedy_ratio
 
                     logging.info(
                         f"[Epoch {epoch + 1}/{EPOCHS}] "
@@ -602,6 +613,7 @@ def train():
                         f"SeqDiv {seq_div_mean:.4f} | "
                         f"BatchDiv {batch_div_ratio:.4f} | "
                         f"TFMask {tf_mask_applied_ratio:.4f} | "
+                        f"PlanMix {planner_mix_greedy_ratio:.4f} | "
                         f"Tau {tau:.4f} | "
                         f"LR {scheduler.get_last_lr()[0]:.2e} | "
                         f"Tok/s {step_tokens / max(step_wall_time, 1e-9):.1f}"

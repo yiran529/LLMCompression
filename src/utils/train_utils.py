@@ -87,6 +87,20 @@ def get_adaptive_tau(global_step: int, total_steps: int, tau_init: float, tau_mi
     return 0.4 - (0.4 - tau_min) * local
 
 
+def get_planner_mix_greedy_ratio(
+    *,
+    global_step: int,
+    total_steps: int,
+    ratio_min: float,
+    ratio_max: float,
+) -> float:
+    """linearly increase planner greedy-row ratio from `ratio_min` to `ratio_max`."""
+    lo = min(float(ratio_min), float(ratio_max))
+    hi = max(float(ratio_min), float(ratio_max))
+    progress = min(1.0, max(0.0, float(global_step) / max(1.0, float(total_steps))))
+    return lo + (hi - lo) * progress
+
+
 def get_stage2_tf_mask_ratio(
     *,
     global_step: int,
@@ -283,6 +297,9 @@ def _build_wandb_config(
         "fp32_trainable": FP32_TRAINABLE,
         "tau_init": TAU_INIT,
         "tau_min": TAU_MIN,
+        "train_planner_sampling_mode": TRAIN_PLANNER_SAMPLING_MODE,
+        "train_planner_mix_greedy_ratio_min": TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN,
+        "train_planner_mix_greedy_ratio_max": TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX,
         "min_concept_steps": MIN_CONCEPT_STEPS,
         "allow_planner_base_tokens": ALLOW_PLANNER_BASE_TOKENS,
         "lambda_rec": LAMBDA_REC,

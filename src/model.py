@@ -26,6 +26,40 @@ def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = False) 
     y_hard = torch.zeros_like(y_soft).scatter_(-1, idx, 1.0)
     return y_hard - y_soft.detach() + y_soft
 
+
+def _select_planner_tokens(
+    *,
+    masked_logits: torch.Tensor,
+    tau: float,
+    sampling_mode: str,
+    mix_greedy_ratio: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """select planner token distributions and hard token IDs under gumbel/greedy/mix modes."""
+    if sampling_mode == "gumbel":
+        probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
+        sampled_ids = probs.argmax(dim=-1)  # [B]
+        return probs, sampled_ids
+
+    probs_greedy = F.softmax(masked_logits, dim=-1)
+    probs_greedy = torch.nan_to_num(probs_greedy, nan=0.0, posinf=0.0, neginf=0.0)
+    probs_greedy = probs_greedy / (probs_greedy.sum(dim=-1, keepdim=True) + 1e-8)
+    sampled_greedy = masked_logits.argmax(dim=-1)  # [B]
+
+    if sampling_mode == "greedy":
+        return probs_greedy, sampled_greedy
+
+    if sampling_mode == "mix":
+        ratio = min(1.0, max(0.0, float(mix_greedy_ratio)))
+        probs_gumbel = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
+        sampled_gumbel = probs_gumbel.argmax(dim=-1)  # [B]
+        use_greedy = torch.rand((masked_logits.size(0),), device=masked_logits.device) < ratio
+        probs = torch.where(use_greedy.unsqueeze(1), probs_greedy, probs_gumbel)
+        sampled_ids = torch.where(use_greedy, sampled_greedy, sampled_gumbel)
+        return probs, sampled_ids
+
+    raise ValueError(f"Unsupported sampling_mode: {sampling_mode}. Use 'gumbel', 'greedy', or 'mix'.")
+
+
 def commitment_loss(e_soft: torch.Tensor, e_hard: torch.Tensor, beta: float) -> torch.Tensor:
     """compute VQ-style commitment loss between soft and hard embeddings."""
     loss1 = (e_soft.detach() - e_hard).pow(2).mean()
@@ -299,6 +333,7 @@ def plan_concepts(
     base_vocab_size: int,
     device: str,
     sampling_mode: str = "gumbel",
+    mix_greedy_ratio: float = 0.0,
     use_cache: bool = True,
 ) -> PlannerOutput:
     """generate one variable-length concept sequence from source input."""
@@ -373,16 +408,12 @@ def plan_concepts(
             forced[:, eos_id] = 0.0
             masked_logits[active] = forced
 
-        if sampling_mode == "gumbel":
-            probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
-            sampled_ids = probs.argmax(dim=-1)  # [B]
-        elif sampling_mode == "greedy":
-            probs = F.softmax(masked_logits, dim=-1)
-            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
-            sampled_ids = masked_logits.argmax(dim=-1)  # [B]
-        else:
-            raise ValueError(f"Unsupported sampling_mode: {sampling_mode}. Use 'gumbel' or 'greedy'.")
+        probs, sampled_ids = _select_planner_tokens(
+            masked_logits=masked_logits,
+            tau=tau,
+            sampling_mode=sampling_mode,
+            mix_greedy_ratio=mix_greedy_ratio,
+        )
 
         sampled_ids = torch.where(
             active,
