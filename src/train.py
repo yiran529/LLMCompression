@@ -390,8 +390,8 @@ def train():
                     eos_id=eos_id,
                     device=device,
                 )
-                
-                # ---- [Augment] optional stage-2 TF input masking with step-wise ratio decay ----
+
+                # augment: optional stage-2 TF input masking with step-wise ratio decay
                 decoder_in, tf_mask_target_ratio, tf_mask_applied_ratio = apply_stage2_tf_token_masking(
                     decoder_in=decoder_in,
                     decoder_mask=decoder_mask,
@@ -570,6 +570,7 @@ def train():
                     seq_div_mean = concept_diversity_metrics["train/concept_diversity_seq_mean"]
                     batch_div_ratio = concept_diversity_metrics["train/concept_diversity_batch_ratio"]
                     step_extra_metrics = dict(concept_diversity_metrics)
+                    # ---- [Metric] stage-2 teacher-forcing masking ratio ----
                     if ENABLE_STAGE2_TF_MASKING:
                         step_extra_metrics["train/stage2_tf_mask_ratio_target"] = tf_mask_target_ratio
                         step_extra_metrics["train/stage2_tf_mask_ratio_applied"] = tf_mask_applied_ratio

@@ -43,8 +43,8 @@ EVAL_SKIP_SPECIAL_TOKENS = True
 # Stage-2 teacher-forcing input masking.
 # Linear decay: ratio goes from MAX -> MIN as training step increases.
 ENABLE_STAGE2_TF_MASKING = True
-STAGE2_TF_MASKING_MAX_RATIO = 0.40
-STAGE2_TF_MASKING_MIN_RATIO = 0.10
+STAGE2_TF_MASKING_MAX_RATIO = 0.50
+STAGE2_TF_MASKING_MIN_RATIO = 0.05
 
 TAU_INIT = 1.0
 TAU_MIN = 0.5
