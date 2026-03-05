@@ -313,6 +313,63 @@ def finish_wandb_run(wandb_run, *, total_seconds: int, final_global_step: int) -
     wandb_run.finish()
 
 
+def compute_concept_diversity_metrics(
+    *,
+    planner_out: PlannerOutput,
+    meta: ConceptMeta,
+) -> Dict[str, float]:
+    """Compute per-sequence and batch-level concept-token diversity (excluding EOS tokens)."""
+    # Planner output includes padded/finished positions and EOS markers.
+    # Only valid non-EOS concept tokens are counted for diversity statistics.
+    concept_token_ids = planner_out.concept.token_ids
+    concept_valid_mask = planner_out.concept.valid_mask.bool()
+    concept_effective_mask = concept_valid_mask & concept_token_ids.ne(meta.eos_id)
+
+    concept_seq_diversities: List[float] = []
+    concept_seq_unique_counts: List[float] = []
+    concept_effective_lengths = concept_effective_mask.sum(dim=1)
+    for idx in range(concept_token_ids.size(0)):
+        seq_len = int(concept_effective_lengths[idx].item())
+        if seq_len <= 0:
+            concept_seq_diversities.append(0.0)
+            concept_seq_unique_counts.append(0.0)
+            continue
+        seq_tokens = concept_token_ids[idx][concept_effective_mask[idx]]
+        seq_unique = int(torch.unique(seq_tokens).numel())
+        concept_seq_unique_counts.append(float(seq_unique))
+        concept_seq_diversities.append(float(seq_unique) / float(seq_len))
+
+    if concept_seq_diversities:
+        seq_div_mean = sum(concept_seq_diversities) / float(len(concept_seq_diversities))
+        seq_div_min = min(concept_seq_diversities)
+        seq_div_max = max(concept_seq_diversities)
+        seq_unique_mean = sum(concept_seq_unique_counts) / float(len(concept_seq_unique_counts))
+    else:
+        seq_div_mean = 0.0
+        seq_div_min = 0.0
+        seq_div_max = 0.0
+        seq_unique_mean = 0.0
+
+    batch_tokens = concept_token_ids[concept_effective_mask]
+    batch_token_count = int(batch_tokens.numel())
+    if batch_token_count > 0:
+        batch_unique_count = int(torch.unique(batch_tokens).numel())
+        batch_div_ratio = float(batch_unique_count) / float(batch_token_count)
+    else:
+        batch_unique_count = 0
+        batch_div_ratio = 0.0
+
+    return {
+        "train/concept_diversity_seq_mean": seq_div_mean,
+        "train/concept_diversity_seq_min": seq_div_min,
+        "train/concept_diversity_seq_max": seq_div_max,
+        "train/concept_seq_unique_count_mean": seq_unique_mean,
+        "train/concept_diversity_batch_ratio": batch_div_ratio,
+        "train/concept_batch_unique_count": float(batch_unique_count),
+        "train/concept_batch_token_count": float(batch_token_count),
+    }
+
+
 def log_wandb_step_metrics(
     *,
     wandb_run,
@@ -337,6 +394,7 @@ def log_wandb_step_metrics(
     step_tokens: int,
     scaler,
     stage_metrics: Dict[str, float],
+    extra_metrics: Optional[Dict[str, float]] = None,
 ) -> None:
     """build and log one training-step metric packet to wandb."""
     if wandb_run is None:
@@ -362,6 +420,8 @@ def log_wandb_step_metrics(
         "train/epoch": float(epoch + 1),
     }
     metrics["train/concept_len"] = float(avg_len)
+    if extra_metrics:
+        metrics.update({k: float(v) for k, v in extra_metrics.items()})
     if scaler is not None and scaler.is_enabled():
         metrics["amp/grad_scale"] = float(scaler.get_scale())
     if torch.cuda.is_available():

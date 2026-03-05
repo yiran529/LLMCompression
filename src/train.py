@@ -548,6 +548,13 @@ def train():
                     recent = epoch_losses[-min(log_every, len(epoch_losses)) :]
                     avg_loss = sum(recent) / max(1, len(recent))
                     avg_len = planner_out.concept.actual_lengths.float().mean().item()
+                    # ---- [Metric] concept-token diversity for current planned batch ----
+                    concept_diversity_metrics = compute_concept_diversity_metrics(
+                        planner_out=planner_out,
+                        meta=meta,
+                    )
+                    seq_div_mean = concept_diversity_metrics["train/concept_diversity_seq_mean"]
+                    batch_div_ratio = concept_diversity_metrics["train/concept_diversity_batch_ratio"]
 
                     logging.info(
                         f"[Epoch {epoch + 1}/{EPOCHS}] "
@@ -562,6 +569,8 @@ def train():
                         f"QuotaBar {float(quota_bar.detach().cpu()):.4f} | "
                         f"QuotaLam {float(model.planner_quota.lambda_value.detach().cpu()):.4f} | "
                         f"ConceptLen {avg_len:.2f} | "
+                        f"SeqDiv {seq_div_mean:.4f} | "
+                        f"BatchDiv {batch_div_ratio:.4f} | "
                         f"Tau {tau:.4f} | "
                         f"LR {scheduler.get_last_lr()[0]:.2e} | "
                         f"Tok/s {step_tokens / max(step_wall_time, 1e-9):.1f}"
@@ -590,6 +599,7 @@ def train():
                         step_tokens=step_tokens,
                         scaler=scaler,
                         stage_metrics=stage_metrics,
+                        extra_metrics=concept_diversity_metrics,
                     )
 
                 # ---- [Step] periodic eval and checkpoint ----

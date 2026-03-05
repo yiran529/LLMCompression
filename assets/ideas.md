@@ -525,3 +525,8 @@ g = S(z^**{\text{new}})-S(z^**{\text{old}})
 现在似乎又一点进展如下：concept tokens序列多样性稍微好了一些，同一个step的eval中不同样本的concept tokens展现了一定差异性
 但是仍然有问题：同一个step的eval中不同样本的concept tokens其实还是比较接近，而且容易出现连续几个concept tokens都相同的情况，最终output重建结果也很差
 这可能是因为训练还没够吗（因为我只训了不到1 epoch）
+
+# 进一步改进
+1. 增加一些调试信息，记录训练时concept tokens的使用情况
+2. input corruption / window / noisy embedding
+3. 利用concept tokens 预测文本的一些全局属性
