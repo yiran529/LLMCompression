@@ -50,7 +50,7 @@ def train():
     # =========================
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
     tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True)
-    special_tokens = build_concept_special_tokens(CONCEPT_TYPE_CONFIGS)
+    special_tokens = build_concept_special_tokens(CONCEPT_CONFIG)
     added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     logging.info(f"[INFO] added special tokens: {added}")
 
@@ -108,8 +108,8 @@ def train():
     # =========================
     # 5) Build unified model and optional resume head states
     # =========================
-    metas = build_concept_metas(tokenizer, CONCEPT_TYPE_CONFIGS, device=device)
-    num_type_embeddings = 1 + len(metas)
+    meta = build_concept_meta(tokenizer, CONCEPT_CONFIG, device=device)
+    num_type_embeddings = 2
     model = SharedBackboneUnifiedHead(
         model_base,
         num_type_embeddings=num_type_embeddings,
@@ -186,10 +186,10 @@ def train():
     # =========================
     # 7) Build masks
     # =========================
-    blocked_ids = build_executor_blocklist(metas, plan_token_id=plan_token_id)
+    blocked_ids = build_executor_blocklist(meta, plan_token_id=plan_token_id)
     vocab_size = model_base.get_input_embeddings().num_embeddings
     mask_cache = ConceptMaskCache(
-        metas=metas,
+        meta=meta,
         vocab_size=vocab_size,
         base_vocab_size=base_vocab_size,
         blocked_for_executor=blocked_ids,
@@ -279,7 +279,7 @@ def train():
         f"[INFO] output_head trainable rows: [{base_vocab_size}, {vocab_size}) "
         f"({new_rows} rows, {effective_head_params:,} params)"
     )
-    logging.info(f"[INFO] concept types: {[m.name for m in metas]}")
+    logging.info("[INFO] concept type: single")
     logging.info(f"[INFO] steps: total={total_steps}, warmup={warmup_steps}")
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())
@@ -355,7 +355,7 @@ def train():
                     attention_mask=attention_mask,
                     plan_token_id=plan_token_id,
                     bos_id=bos_id,
-                    metas=metas,
+                    meta=meta,
                     mask_cache=mask_cache,
                     tau=tau,
                     min_concept_steps=MIN_CONCEPT_STEPS,
@@ -376,7 +376,7 @@ def train():
                 ) = build_executor_prefix(
                     model,
                     planner_out=planner_out,
-                    metas=metas,
+                    meta=meta,
                     bos_id=bos_id,
                     device=device,
                 )
@@ -547,9 +547,7 @@ def train():
                 if global_step % log_every == 1:
                     recent = epoch_losses[-min(log_every, len(epoch_losses)) :]
                     avg_loss = sum(recent) / max(1, len(recent))
-                    avg_lens = []
-                    for out_type in planner_out.per_type:
-                        avg_lens.append(out_type.actual_lengths.float().mean().item())
+                    avg_len = planner_out.concept.actual_lengths.float().mean().item()
 
                     logging.info(
                         f"[Epoch {epoch + 1}/{EPOCHS}] "
@@ -563,7 +561,7 @@ def train():
                         f"Quota {float(loss_quota.detach().cpu()):.4f} | "
                         f"QuotaBar {float(quota_bar.detach().cpu()):.4f} | "
                         f"QuotaLam {float(model.planner_quota.lambda_value.detach().cpu()):.4f} | "
-                        f"TypeLens {','.join([f'{x:.2f}' for x in avg_lens])} | "
+                        f"ConceptLen {avg_len:.2f} | "
                         f"Tau {tau:.4f} | "
                         f"LR {scheduler.get_last_lr()[0]:.2e} | "
                         f"Tok/s {step_tokens / max(step_wall_time, 1e-9):.1f}"
@@ -573,8 +571,8 @@ def train():
                         wandb_run=wandb_run,
                         global_step=global_step,
                         epoch=epoch,
-                        metas=metas,
-                        avg_lens=avg_lens,
+                        meta=meta,
+                        avg_len=avg_len,
                         avg_loss=avg_loss,
                         loss=loss,
                         loss_rec=loss_rec,
@@ -599,7 +597,7 @@ def train():
                     run_periodic_eval(
                         model=model,
                         tokenizer=tokenizer,
-                        metas=metas,
+                        meta=meta,
                         mask_cache=mask_cache,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -617,7 +615,7 @@ def train():
                     save_checkpoint(
                         model,
                         tokenizer,
-                        metas,
+                        meta,
                         global_step,
                         OUTPUT_DIR,
                         optimizer=optimizer,
@@ -647,7 +645,7 @@ def train():
     save_checkpoint(
         model,
         tokenizer,
-        metas,
+        meta,
         "final",
         OUTPUT_DIR,
         optimizer=optimizer,

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_TEXT, ConceptTypeConfig
+from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_CONCEPT, TYPE_ID_TEXT, ConceptConfig
 
 def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = False) -> torch.Tensor:
     """sample relaxed/straight-through categorical vectors from logits."""
@@ -39,8 +39,7 @@ def usage_kl_to_uniform(hist: torch.Tensor) -> torch.Tensor:
     return torch.sum(hist * (torch.log(hist + EPS) - torch.log(u + EPS)))
 
 @dataclass
-class ConceptTypeMeta:
-    name: str
+class ConceptMeta:
     type_id: int
     eos_id: int
     concept_ids: torch.Tensor
@@ -51,29 +50,22 @@ class ConceptTypeMeta:
 class ConceptMaskCache:
     def __init__(
         self,
-        metas: List[ConceptTypeMeta],
+        meta: ConceptMeta,
         vocab_size: int,
         base_vocab_size: int,
         blocked_for_executor: List[int],
         device: str,
         allow_base_tokens: bool = True,
     ):
-        """build reusable per-type planner masks and executor output block mask."""
-        # Planner 每个 concept type 都有一张“词表白名单”偏置表。
-        # 用法：logits + bias 后，非白名单 token 会被加上 very_neg（近似 -inf），
-        # 从而在 softmax / 采样时几乎不可能被选中。
-        self.allowed_logits_bias: Dict[str, torch.Tensor] = {}
+        """build planner mask and executor output block mask for single concept type."""
         very_neg = -1e4
-        for meta in metas:
-            bias = torch.full((vocab_size,), very_neg, device=device, dtype=torch.float32)
-            # 允许输出：原词表 token（如果 allow_base_tokens=True）+ 该 type 的概念 token + 该 type 的 EOS token。
-            if base_vocab_size > 0 and allow_base_tokens:
-                bias[:base_vocab_size] = 0.0
-            bias[meta.concept_ids_with_eos] = 0.0
-            self.allowed_logits_bias[meta.name] = bias
+        self.allowed_logits_bias = torch.full((vocab_size,), very_neg, device=device, dtype=torch.float32)
+        if base_vocab_size > 0 and allow_base_tokens:
+            self.allowed_logits_bias[:base_vocab_size] = 0.0
+        self.allowed_logits_bias[meta.concept_ids_with_eos] = 0.0
 
         # Executor 端输出屏蔽表：True 的位置表示“禁止生成”。
-        # 这里通常屏蔽所有 planner 专用 token（<PLAN>/<EOS_i>/<C_i_*>)，
+        # 这里通常屏蔽所有 planner 专用 token（<PLAN>/<EOS_CONCEPT>/<C_*>)，
         # 避免解码文本时又吐出概念符号。
         self.executor_block_bool = torch.zeros(vocab_size, device=device, dtype=torch.bool)
         if blocked_for_executor:
@@ -225,7 +217,7 @@ class PlannerTypeOutput:
 
 @dataclass
 class PlannerOutput:
-    per_type: List[PlannerTypeOutput]
+    concept: PlannerTypeOutput
     quota_mass_sum: torch.Tensor
     quota_count: torch.Tensor
 
@@ -263,42 +255,35 @@ def compute_planner_quota_loss(
         return zero, zero
     return quota_controller.compute_loss(planner_out.quota_mass_sum, planner_out.quota_count)
 
-def build_concept_special_tokens(type_cfgs: List[ConceptTypeConfig]) -> List[str]:
-    """define all planner-side special tokens for typed concept vocabularies."""
+def build_concept_special_tokens(cfg: ConceptConfig) -> List[str]:
+    """define planner-side special tokens for single concept vocabulary."""
     special_tokens: List[str] = ["<PLAN>"]
-    for cfg in type_cfgs:
-        special_tokens.append(f"<EOS_{cfg.name}>")
-        for k in range(cfg.size):
-            special_tokens.append(f"<C_{cfg.name}_{k}>")
+    special_tokens.append("<EOS_CONCEPT>")
+    for k in range(cfg.size):
+        special_tokens.append(f"<C_{k}>")
     return special_tokens
 
-def build_concept_metas(
+def build_concept_meta(
     tokenizer: AutoTokenizer,
-    type_cfgs: List[ConceptTypeConfig],
+    cfg: ConceptConfig,
     device: str,
-) -> List[ConceptTypeMeta]:
-    """resolve typed concept token IDs and pack them into runtime metadata."""
-    metas: List[ConceptTypeMeta] = []
-    for i, cfg in enumerate(type_cfgs, start=1):
-        eos_id = tokenizer.convert_tokens_to_ids(f"<EOS_{cfg.name}>")
-        concept_tokens = [f"<C_{cfg.name}_{k}>" for k in range(cfg.size)]
-        concept_ids = tokenizer.convert_tokens_to_ids(concept_tokens)
-        concept_ids_t = torch.tensor(concept_ids, device=device, dtype=torch.long)
-        concept_ids_eos = torch.cat(
-            [concept_ids_t, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
-        )
-        metas.append(
-            ConceptTypeMeta(
-                name=cfg.name,
-                type_id=i,
-                eos_id=eos_id,
-                concept_ids=concept_ids_t,
-                concept_ids_with_eos=concept_ids_eos,
-                max_steps=cfg.max_steps,
-                target_ratio=cfg.target_ratio,
-            )
-        )
-    return metas
+) -> ConceptMeta:
+    """resolve concept token IDs and pack them into runtime metadata."""
+    eos_id = tokenizer.convert_tokens_to_ids("<EOS_CONCEPT>")
+    concept_tokens = [f"<C_{k}>" for k in range(cfg.size)]
+    concept_ids = tokenizer.convert_tokens_to_ids(concept_tokens)
+    concept_ids_t = torch.tensor(concept_ids, device=device, dtype=torch.long)
+    concept_ids_eos = torch.cat(
+        [concept_ids_t, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
+    )
+    return ConceptMeta(
+        type_id=TYPE_ID_CONCEPT,
+        eos_id=eos_id,
+        concept_ids=concept_ids_t,
+        concept_ids_with_eos=concept_ids_eos,
+        max_steps=cfg.max_steps,
+        target_ratio=cfg.target_ratio,
+    )
 
 def plan_concepts(
     model: SharedBackboneUnifiedHead,
@@ -307,25 +292,20 @@ def plan_concepts(
     attention_mask: torch.Tensor,
     plan_token_id: int,
     bos_id: int,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     mask_cache: ConceptMaskCache,
     tau: float,
     min_concept_steps: int,
     base_vocab_size: int,
     device: str,
     sampling_mode: str = "gumbel",
+    use_cache: bool = True,
 ) -> PlannerOutput:
-    """generate one variable-length concept sequence per type from source input."""
+    """generate one variable-length concept sequence from source input."""
     bsz, _ = input_ids.shape
     hidden_size = model.hidden_size
     dtype_embed = model.token_embed_base.weight.dtype
 
-    # ---------------------------------------------------------------------
-    # 1) Build planner prompt.
-    # Prompt layout is:
-    #   [<BOS>, normal_tokens..., <PLAN>]
-    # so the plan token is appended after the normal-token prefix.
-    # ---------------------------------------------------------------------
     bos_col = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
     plan_col = torch.full((bsz, 1), plan_token_id, device=device, dtype=torch.long)
     planner_input_ids = torch.cat([bos_col, input_ids, plan_col], dim=1)
@@ -338,146 +318,61 @@ def plan_concepts(
         ],
         dim=1,
     )
-    # Use cumsum on mask to determine real positions, skipping padded regions.
-    # This ensures <PLAN> immediately follows the last valid text token,
-    # avoiding "long-distance" gaps caused by right-padding.
     planner_pos = torch.cumsum(planner_mask, dim=1) - 1
-    # Ensure non-negative positions (padding positions might get duplicate/garbage values, masked anyway)
     planner_pos = planner_pos.clamp(min=0)
 
-    # Prime the KV cache with the full planner prompt.
-    # logits_t is the next-token distribution after consuming prompt.
     planner_embeds = model.embed_with_type(planner_input_ids, planner_type_ids)
     out = model.forward_backbone(
         inputs_embeds=planner_embeds,
         attention_mask=planner_mask,
         position_ids=planner_pos,
-        use_cache=True,
+        use_cache=use_cache,
     )
     logits_t = model.forward_head(out.last_hidden_state[:, -1, :])  # [B, V]
     past_kv = out.past_key_values
 
-    num_types = len(metas)
     ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
-    max_steps_by_type = torch.tensor([m.max_steps for m in metas], device=device, dtype=torch.long)
-    eos_id_by_type = torch.tensor([m.eos_id for m in metas], device=device, dtype=torch.long)
-    type_id_by_type = torch.tensor([m.type_id for m in metas], device=device, dtype=torch.long)
+    eos_id = int(meta.eos_id)
     src_lengths = attention_mask.sum(dim=1).to(torch.long)
-    expected_by_type = [
-        (src_lengths.float() * m.target_ratio).long().clamp(min=1, max=m.max_steps) for m in metas
-    ]
+    expected = (src_lengths.float() * meta.target_ratio).long().clamp(min=1, max=meta.max_steps)
 
-    # Online auxiliary loss accumulators (avoid storing large per-step buffers).
-    commit_sum1 = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
-    commit_sum2 = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
-    hist_sum = [
-        torch.zeros((int(m.concept_ids.numel()),), device=device, dtype=torch.float32) for m in metas
-    ]
-    eos_sum = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
-    eos_count = [torch.zeros((), device=device, dtype=torch.float32) for _ in metas]
+    commit_sum1 = torch.zeros((), device=device, dtype=torch.float32)
+    commit_sum2 = torch.zeros((), device=device, dtype=torch.float32)
+    hist_sum = torch.zeros((int(meta.concept_ids.numel()),), device=device, dtype=torch.float32)
+    eos_sum = torch.zeros((), device=device, dtype=torch.float32)
+    eos_count = torch.zeros((), device=device, dtype=torch.float32)
 
-    # ---------------------------------------------------------------------
-    # 2) Precompute type-level constants.
-    # ---------------------------------------------------------------------
-    # allowed_bias_by_type[t, v] is 0 for allowed tokens of type t and -1e4 otherwise.
-    # Adding this to logits enforces the per-type vocabulary.
-    allowed_bias_by_type = torch.stack(
-        [mask_cache.allowed_logits_bias[m.name] for m in metas], dim=0
-    )  # [T, V]
-    # concept_tables[t] holds token embeddings for [C_t..., EOS_t].
-    concept_tables = [
-        model.embed_tokens(m.concept_ids_with_eos) for m in metas
-    ]  # list of [K_i+1, H]
+    concept_table = model.embed_tokens(meta.concept_ids_with_eos)  # [K+1, H]
+    type_vec = model.type_embed.weight[int(meta.type_id)].view(1, -1).to(dtype=dtype_embed)
 
-    # ---------------------------------------------------------------------
-    # 3) Allocate fixed-shape output buffers per type.
-    # We fill these buffers asynchronously using (sample_idx, step_in_type).
-    # ---------------------------------------------------------------------
-    buffers: List[Dict[str, torch.Tensor]] = []
-    for meta in metas:
-        buffers.append(
-            {
-                "token_ids": torch.full(
-                    (bsz, meta.max_steps), meta.eos_id, device=device, dtype=torch.long
-                ),
-                "valid": torch.zeros((bsz, meta.max_steps), device=device, dtype=torch.long),
-                "st_embeds": torch.zeros(
-                    (bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed
-                ),
-            }
-        )
+    concept_tokens = torch.full((bsz, meta.max_steps), eos_id, device=device, dtype=torch.long)
+    concept_valid = torch.zeros((bsz, meta.max_steps), device=device, dtype=torch.long)
+    concept_st_embeds = torch.zeros((bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed)
+    finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
 
-    # ---------------------------------------------------------------------
-    # 4) Asynchronous per-sample state.
-    # Each sample advances independently:
-    # - cur_type_idx[b]: which concept type sample b is currently generating.
-    # - step_in_type[b]: local step index within current type.
-    # - finished[b]: whether sample b has finished all types.
-    # ---------------------------------------------------------------------
-    cur_type_idx = torch.zeros(bsz, device=device, dtype=torch.long)  # [B], range [0, T)
-    step_in_type = torch.zeros(bsz, device=device, dtype=torch.long)  # [B], range [0, max_steps_i)
-    finished = torch.zeros(bsz, device=device, dtype=torch.bool)      # [B]
-
-    # Hard safety bound with max_steps constraint preserved.
-    # A sample can emit at most sum(max_steps_i) tokens across all types.
-    max_total_steps = int(max_steps_by_type.sum().item())
     quota_mass_sum = torch.zeros((), device=device, dtype=torch.float32)
     quota_count = torch.zeros((), device=device, dtype=torch.float32)
 
-    # [FIX] Initialize running attention mask and position IDs for autoregressive generation.
-    # The mask must cover [Prompt + Past_Generated], not just the current step.
-    # The position IDs should ideally be continuous for RoPE-based models to maintain relative distance to the prompt.
     cache_attention_mask = planner_mask
     cache_position_ids = planner_pos[:, -1:].clone() + 1
 
-    # ---------------------------------------------------------------------
-    # 5) Main asynchronous decoding loop.
-    # One loop iteration emits exactly one token per active sample.
-    # ---------------------------------------------------------------------
-    for _ in range(max_total_steps):
+    for step in range(meta.max_steps):
         active = ~finished
         if not torch.any(active):
             break
 
-        # type_idx_safe lets us gather tensors for all rows (including finished rows)
-        # without out-of-range indices.
-        type_idx_safe = torch.clamp(cur_type_idx, max=num_types - 1)
-        # Keep previous local step for indexing current write positions.
-        step_before = step_in_type.clone()
-
-        masked_logits = logits_t.float().clone()  # [B, V]
-
-        # Apply type-specific vocab mask sample-wise.
-        # Different samples can use different type masks in the same iteration.
-        for t in range(num_types):
-            row_mask = active & (type_idx_safe == t)
-            if torch.any(row_mask):
-                masked_logits[row_mask] = masked_logits[row_mask] + allowed_bias_by_type[t].view(1, -1)
-
-        # Inactive rows still flow through batched ops; force deterministic dummy EOS.
+        masked_logits = logits_t.float().clone() + mask_cache.allowed_logits_bias.view(1, -1)
         if torch.any(~active):
             masked_logits[~active] = -1e4
-            masked_logits[~active, int(eos_id_by_type[-1].item())] = 0.0
+            masked_logits[~active, eos_id] = 0.0
 
-        # Enforce per-sample decoding rules based on its current type:
-        # - min_concept_steps: EOS blocked at early local steps
-        # - max_steps_by_type: force EOS at last allowed local step
-        for t in range(num_types):
-            row_mask = active & (type_idx_safe == t)
-            if not torch.any(row_mask):
-                continue
-            eos_t = int(eos_id_by_type[t].item())
-            if min_concept_steps > 1:
-                min_mask = row_mask & (step_before < (min_concept_steps - 1))
-                if torch.any(min_mask):
-                    masked_logits[min_mask, eos_t] = -1e4
-            force_mask = row_mask & (step_before >= (max_steps_by_type[t] - 1))
-            if torch.any(force_mask):
-                forced = torch.full_like(masked_logits[force_mask], -1e4)
-                forced[:, eos_t] = 0.0
-                masked_logits[force_mask] = forced
+        if min_concept_steps > 1 and step < (min_concept_steps - 1):
+            masked_logits[active, eos_id] = -1e4
+        if step >= (meta.max_steps - 1):
+            forced = torch.full_like(masked_logits[active], -1e4)
+            forced[:, eos_id] = 0.0
+            masked_logits[active] = forced
 
-        # Select planner token with either stochastic Gumbel-ST (train) or deterministic greedy (infer).
         if sampling_mode == "gumbel":
             probs = gumbel_softmax_sample(masked_logits, tau=tau, hard=True)  # [B, V]
             sampled_ids = probs.argmax(dim=-1)  # [B]
@@ -488,112 +383,65 @@ def plan_concepts(
             sampled_ids = masked_logits.argmax(dim=-1)  # [B]
         else:
             raise ValueError(f"Unsupported sampling_mode: {sampling_mode}. Use 'gumbel' or 'greedy'.")
-        # Keep inactive rows deterministic.
+
         sampled_ids = torch.where(
             active,
             sampled_ids,
-            torch.full_like(sampled_ids, int(eos_id_by_type[-1].item())),
+            torch.full_like(sampled_ids, eos_id),
         )
 
-        # Build one-step inputs for the next backbone call.
-        # We keep full [B, ...] tensors for efficient batched forward.
+        concept_tokens[active, step] = sampled_ids[active]
+        concept_valid[active, step] = 1
+
+        if base_vocab_size > 0:
+            rows_logits = masked_logits[active]
+            logz = torch.logsumexp(rows_logits, dim=-1)
+            logz_base = torch.logsumexp(rows_logits[:, :base_vocab_size], dim=-1)
+            base_mass = torch.exp(logz_base - logz)
+            active_ids = sampled_ids[active]
+            count_mask = active_ids.ne(eos_id)
+            if torch.any(count_mask):
+                quota_mass_sum = quota_mass_sum + base_mass[count_mask].sum()
+                quota_count = quota_count + count_mask.sum().to(quota_count.dtype)
+
+        active_rows = active.nonzero(as_tuple=False).squeeze(1)
+        probs_subset = probs[active_rows].index_select(1, meta.concept_ids_with_eos)  # [N, K+1]
+        hist_sum = hist_sum + probs_subset[:, :-1].sum(dim=0)
+
+        soft_t = torch.matmul(probs_subset.to(concept_table.dtype), concept_table).to(dtype=dtype_embed) + type_vec
+        hard_t = model.embed_tokens(sampled_ids[active_rows]).to(dtype=dtype_embed) + type_vec
+        st_t = hard_t + (soft_t - soft_t.detach())
+
+        soft_f = soft_t.float()
+        hard_f = hard_t.float()
+        commit_sum1 = commit_sum1 + (soft_f.detach() - hard_f).pow(2).sum()
+        commit_sum2 = commit_sum2 + (soft_f - hard_f.detach()).pow(2).sum()
+
+        eos_target = (step >= (expected[active_rows] - 1)).float()
+        eos_logit = masked_logits[active_rows, eos_id]
+        eos_sum = eos_sum + F.binary_cross_entropy_with_logits(
+            eos_logit.float(), eos_target, reduction="sum"
+        )
+        eos_count = eos_count + eos_target.numel()
+
+        concept_st_embeds = concept_st_embeds.index_put(
+            (active_rows, torch.full_like(active_rows, step)),
+            st_t,
+        )
+        finished = finished | sampled_ids.eq(eos_id)
+        if torch.all(finished):
+            break
+
         soft_embed_step = torch.zeros((bsz, hidden_size), device=device, dtype=dtype_embed)
         hard_embed_step = torch.zeros((bsz, hidden_size), device=device, dtype=dtype_embed)
-        step_pos = torch.zeros((bsz, 1), device=device, dtype=torch.long)
-
-        for t, meta in enumerate(metas):
-            row_mask = active & (type_idx_safe == t)
-            if not torch.any(row_mask):
-                continue
-
-            rows = row_mask.nonzero(as_tuple=False).squeeze(1)  # [N_t]   N_t 表示当前步、当前类型 t 的有效样本数（batch 里满足 row_mask 的行数）
-            local_step = step_before[rows]  # [N_t]
-            eos_t = int(meta.eos_id)
-            tok_t = sampled_ids[rows]  # [N_t]
-
-            # Write current results into per-type buffers at async coordinates:
-            #   buffer[type][sample_row, local_step]
-            buffers[t]["token_ids"][rows, local_step] = tok_t
-            buffers[t]["valid"][rows, local_step] = 1
-            # Used for computing quota loss later.
-            if base_vocab_size > 0:
-                rows_logits = masked_logits[rows]
-                # 原词表 + 当前concept tokens词表（包含EOS）一起构成分母，计算EOS占比。
-                logz = torch.logsumexp(rows_logits, dim=-1)
-                # 原词表部分的概率质量总和，作为“超额”概念生成的 proxy 指标。
-                logz_base = torch.logsumexp(rows_logits[:, :base_vocab_size], dim=-1)
-                # 原词表概率质量占比越大，说明生成的概念越“节约”，越不超额。
-                base_mass = torch.exp(logz_base - logz)
-                count_mask = tok_t.ne(eos_t)
-                if torch.any(count_mask):
-                    quota_mass_sum = quota_mass_sum + base_mass[count_mask].sum()
-                    quota_count = quota_count + count_mask.sum().to(quota_count.dtype)
-
-            # Keep only the current type's concept space for soft embedding and stats.
-            probs_subset = probs[rows].index_select(1, meta.concept_ids_with_eos)  # [N_t, K_i+1]
-            hist_sum[t] = hist_sum[t] + probs_subset[:, :-1].sum(dim=0)
-
-            # Add type embedding to both soft/hard token embeddings.
-            type_vec_t = model.type_embed.weight[int(type_id_by_type[t].item())].view(1, -1).to(dtype=dtype_embed)  # [1, H]
-            soft_t = torch.matmul(probs_subset.to(concept_tables[t].dtype), concept_tables[t]).to(dtype=dtype_embed) + type_vec_t
-            hard_t = model.embed_tokens(tok_t).to(dtype=dtype_embed) + type_vec_t
-            st_t = hard_t + (soft_t - soft_t.detach())
-            soft_f = soft_t.float()  # [N_t, H]
-            hard_f = hard_t.float()  # [N_t, H]
-            # Commitment loss terms:
-            # L1 = sum ||sg(soft) - hard||^2, L2 = sum ||soft - sg(hard)||^2
-            commit_sum1[t] = commit_sum1[t] + (soft_f.detach() - hard_f).pow(2).sum()
-            commit_sum2[t] = commit_sum2[t] + (soft_f - hard_f.detach()).pow(2).sum()
-
-            expected_t = expected_by_type[t][rows]  # [N_t]
-            eos_target = (local_step >= (expected_t - 1)).float()  # [N_t]
-            eos_logit = masked_logits[rows, eos_t]  # [N_t]
-            # EOS loss: sum BCEWithLogits(eos_logit, eos_target)
-            eos_sum[t] = eos_sum[t] + F.binary_cross_entropy_with_logits(
-                eos_logit.float(), eos_target, reduction="sum"
-            )
-            eos_count[t] = eos_count[t] + eos_target.numel()
-
-            soft_embed_step[rows] = soft_t
-            hard_embed_step[rows] = hard_t
-            # Keep a differentiable write path so stage-2 loss can flow back to planner ST embeddings.
-            buffers[t]["st_embeds"] = buffers[t]["st_embeds"].index_put((rows, local_step), st_t)
-            step_pos[rows, 0] = local_step + 1  # per-type position reset rule.
-
-            # Async state transition per sample:
-            # - sampled EOS_t: move to next type, reset local step to 0
-            # - otherwise: stay in same type, local step + 1
-            stop_t = tok_t.eq(eos_t)
-            next_type = cur_type_idx[rows] + stop_t.long()
-            cur_type_idx[rows] = next_type
-            step_in_type[rows] = torch.where(
-                stop_t,
-                torch.zeros_like(local_step),
-                local_step + 1,
-            )
-            finished[rows] = next_type >= num_types
-
-        # Finished rows still participate in batched forward with harmless dummy values.
+        soft_embed_step[active_rows] = soft_t
+        hard_embed_step[active_rows] = hard_t
         if torch.any(~active):
-            dummy_ids = torch.full(
-                ((~active).sum().item(),),
-                int(eos_id_by_type[-1].item()),
-                device=device,
-                dtype=torch.long,
-            )
-            hard_embed_step[~active] = model.embed_tokens(dummy_ids)
+            dummy_ids = torch.full(((~active).sum().item(),), eos_id, device=device, dtype=torch.long)
+            hard_embed_step[~active] = model.embed_tokens(dummy_ids) + type_vec
             soft_embed_step[~active] = hard_embed_step[~active]
-            step_pos[~active, 0] = 0
 
-        # Straight-through one-step input to advance shared KV cache.
         st_embed = hard_embed_step + (soft_embed_step - soft_embed_step.detach())  # [B, H]
-
-        # [FIX] Update attention mask and position IDs for the next step.
-        # AR generation requires position IDs to increase monotonically to maintain RoPE relative distances,
-        # unless specific "restart" semantics are intended. Given concepts are generated sequentially, 
-        # continuous position IDs are safer to avoid attention anomalies.
-        # We ignore the per-type `step_pos` reset logic for the BACKBONE forward pass to keep the LM context valid.
-        
         cache_attention_mask = torch.cat(
             [cache_attention_mask, torch.ones((bsz, 1), device=device, dtype=torch.long)],
             dim=1
@@ -605,62 +453,35 @@ def plan_concepts(
             attention_mask=cache_attention_mask,  # [B, T_curr]
             position_ids=cache_position_ids,      # [B, 1]
             past_key_values=past_kv,
-            use_cache=True,
+            use_cache=use_cache,
         )
         logits_t = model.forward_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
         past_kv = out_next.past_key_values
 
-    # ---------------------------------------------------------------------
-    # 6) Pack per-type buffers back into PlannerOutput format.
-    # ---------------------------------------------------------------------
-    per_type_outputs: List[PlannerTypeOutput] = []
-    for t, meta in enumerate(metas):
-        token_ids = buffers[t]["token_ids"]
-        valid_mask = buffers[t]["valid"]
-        actual_lengths = valid_mask.sum(dim=1)
+    actual_lengths = concept_valid.sum(dim=1)
+    concept_out = PlannerTypeOutput(
+        token_ids=concept_tokens,
+        valid_mask=concept_valid,
+        actual_lengths=actual_lengths,
+        st_embeds=concept_st_embeds,
+    )
 
-        per_type_outputs.append(
-            PlannerTypeOutput(
-                token_ids=token_ids,
-                valid_mask=valid_mask,
-                actual_lengths=actual_lengths,
-                st_embeds=buffers[t]["st_embeds"],
-            )
-        )
+    denom = max(1.0, float(bsz * meta.max_steps * hidden_size))
+    loss_commit = commit_sum1 / denom + BETA_COMMIT * (commit_sum2 / denom)
 
-    loss_commit = torch.zeros((), device=device, dtype=torch.float32)
-    loss_unif = torch.zeros((), device=device, dtype=torch.float32)
-    loss_eos = torch.zeros((), device=device, dtype=torch.float32)
-    loss_len = torch.zeros((), device=device, dtype=torch.float32)
-    n = max(1, len(metas))
-    for t, meta in enumerate(metas):
-        denom = max(1.0, float(bsz * meta.max_steps * hidden_size))
-        loss_commit = loss_commit + commit_sum1[t] / denom + BETA_COMMIT * (commit_sum2[t] / denom)
+    hist_total = hist_sum.sum()
+    if float(hist_total.detach().item()) > 0.0:
+        hist = hist_sum / hist_total.clamp_min(1.0)
+        loss_unif = usage_kl_to_uniform(hist)
+    else:
+        loss_unif = torch.zeros((), device=device, dtype=torch.float32)
 
-        hist = hist_sum[t]
-        # When planner emits no concept token for this type, `hist.sum()==0`.
-        # Normalizing by tiny EPS amplifies gradients (~1/EPS), which can
-        # cause finite loss but non-finite gradients. Skip uniform KL in that case.
-        hist_total = hist.sum()
-        if float(hist_total.detach().item()) > 0.0:
-            hist = hist / hist_total.clamp_min(1.0)
-            loss_unif = loss_unif + usage_kl_to_uniform(hist)
-
-        denom_eos = eos_count[t].clamp_min(1.0)
-        loss_eos = loss_eos + eos_sum[t] / denom_eos
-
-        expected = expected_by_type[t]
-        actual = per_type_outputs[t].actual_lengths
-        loss_len = loss_len + F.relu(actual.float() - expected.float()).mean()
-
-    loss_commit = loss_commit / n
-    loss_unif = loss_unif / n
-    loss_eos = loss_eos / n
-    loss_len = loss_len / n
+    loss_eos = eos_sum / eos_count.clamp_min(1.0)
+    loss_len = F.relu(actual_lengths.float() - expected.float()).mean()
 
     return (
         PlannerOutput(
-            per_type=per_type_outputs,
+            concept=concept_out,
             quota_mass_sum=quota_mass_sum,
             quota_count=quota_count,
         ),
@@ -674,13 +495,12 @@ def build_executor_prefix(
     model: SharedBackboneUnifiedHead,
     *,
     planner_out: PlannerOutput,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     bos_id: int,
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """build concept-only executor prefix with type ids, mask, reset positions, and embeddings."""
-    # Batch size B.
-    bsz = planner_out.per_type[0].token_ids.size(0)
+    bsz = planner_out.concept.token_ids.size(0)
 
     # Each list stores one prefix block; blocks are concatenated at the end.
     # token/type/mask/pos block shape: [B, L_i], embed block shape: [B, L_i, H].
@@ -698,40 +518,28 @@ def build_executor_prefix(
     mask_chunks.append(torch.ones((bsz, 1), device=device, dtype=torch.long))
     embed_chunks.append(model.embed_with_type(bos, bos_type))
 
-    # Blocks 1..T: append each concept-type segment from planner output.
-    for meta, type_out in zip(metas, planner_out.per_type):
-        # Trim each type block to the maximum valid length in the batch to save memory.
-        # type_lens: [B], max_len: scalar.
-        type_lens = type_out.valid_mask.sum(dim=1).to(torch.long)
-        max_len = int(type_lens.max().item())
-        if max_len == 0:
-            continue
-        # tok/msk/typ: [B, max_len].
-        tok = type_out.token_ids[:, :max_len]
-        msk = type_out.valid_mask[:, :max_len]
-        typ = torch.full_like(tok, meta.type_id)
+    type_out = planner_out.concept
+    type_lens = type_out.valid_mask.sum(dim=1).to(torch.long)
+    max_len = int(type_lens.max().item())
 
-        token_chunks.append(tok)
-        type_chunks.append(typ)
-        mask_chunks.append(msk)
-        if type_out.st_embeds is not None:
-            # st: [B, max_len, H], zero out padded positions with msk.
-            st = type_out.st_embeds[:, :max_len, :]
-            st = st * msk.unsqueeze(-1).to(st.dtype)
-            embed_chunks.append(st)
-        else:
-            # Fallback to standard token+type embedding if ST embeds are absent.
-            embed_chunks.append(model.embed_with_type(tok, typ))
-        # Critical rule: position indices restart from 1 for each type block.
-    # Concatenate all prefix blocks into final executor inputs.
-    # prefix_token_ids/prefix_type_ids/prefix_mask/prefix_pos: [B, Lp]
-    # prefix_embeds: [B, Lp, H]
+    assert max_len > 0, "Planner did not generate any valid concept tokens, cannot build executor prefix."
+    tok = type_out.token_ids[:, :max_len]
+    msk = type_out.valid_mask[:, :max_len]
+    typ = torch.full_like(tok, meta.type_id)
+    token_chunks.append(tok)
+    type_chunks.append(typ)
+    mask_chunks.append(msk)
+    if type_out.st_embeds is not None:
+        st = type_out.st_embeds[:, :max_len, :]
+        st = st * msk.unsqueeze(-1).to(st.dtype)
+        embed_chunks.append(st)
+    else:
+        embed_chunks.append(model.embed_with_type(tok, typ))
+
     prefix_token_ids = torch.cat(token_chunks, dim=1)
     prefix_type_ids = torch.cat(type_chunks, dim=1)
     prefix_mask = torch.cat(mask_chunks, dim=1)
     prefix_embeds = torch.cat(embed_chunks, dim=1)
-    # [FIX] Use continuous positions to align with planner's AR logic, matching valid tokens only.
-    # BOS (start) gets pos=0. Padding regions repeat the last valid position (masked out anyway).
     prefix_pos = torch.cumsum(prefix_mask, dim=1) - 1
     prefix_pos = prefix_pos.clamp(min=0).to(torch.long)
 
@@ -773,14 +581,13 @@ def build_decoder_tensors(
 SharedBackboneTwoHeads = SharedBackboneUnifiedHead
 
 def build_executor_blocklist(
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     plan_token_id: int,
 ) -> List[int]:
     """return token IDs that executor logits must never generate."""
     blocked: List[int] = [plan_token_id]
-    for meta in metas:
-        blocked.append(meta.eos_id)
-        blocked.extend(meta.concept_ids.tolist())
+    blocked.append(meta.eos_id)
+    blocked.extend(meta.concept_ids.tolist())
     return blocked
 
 ####################################################################
@@ -810,7 +617,7 @@ def run_executor_inference(
     plan_token_id: int,
     bos_id: int,
     eos_id: int,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     mask_cache: ConceptMaskCache,
     device: str,
     max_new_tokens: int = 64,
@@ -830,7 +637,7 @@ def run_executor_inference(
             attention_mask=attention_mask,
             plan_token_id=plan_token_id,
             bos_id=bos_id,
-            metas=metas,
+            meta=meta,
             mask_cache=mask_cache,
             tau=planner_tau,
             sampling_mode="greedy",
@@ -847,7 +654,7 @@ def run_executor_inference(
         ) = build_executor_prefix(
             model,
             planner_out=planner_out,
-            metas=metas,
+            meta=meta,
             bos_id=bos_id,
             device=device,
         )

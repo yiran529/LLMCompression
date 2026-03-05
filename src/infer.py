@@ -37,7 +37,7 @@ def run_inference() -> None:
             plan_token_id=runtime.plan_token_id,
             bos_id=runtime.bos_id,
             eos_id=runtime.eos_id,
-            metas=runtime.metas,
+            meta=runtime.meta,
             mask_cache=runtime.mask_cache,
             device=runtime.device,
             max_new_tokens=INFER_MAX_NEW_TOKENS,
@@ -59,7 +59,7 @@ def run_inference() -> None:
             print("Concepts:")
             for line in format_concepts(
                 tokenizer=tokenizer,
-                metas=runtime.metas,
+                meta=runtime.meta,
                 planner_out=infer_out.planner_out,
                 sample_idx=i,
             ):

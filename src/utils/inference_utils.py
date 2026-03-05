@@ -13,7 +13,7 @@ from src.model import *
 class InferenceRuntime:
     model: SharedBackboneUnifiedHead
     tokenizer: AutoTokenizer
-    metas: List[ConceptTypeMeta]
+    meta: ConceptMeta
     mask_cache: ConceptMaskCache
     plan_token_id: int
     bos_id: int
@@ -80,27 +80,21 @@ def _load_backbone_model(
     return AutoModelForCausalLM.from_pretrained(backbone_dir, **model_kwargs).to(device)
 
 
-def _build_metas_from_state(head_state: dict, device: str) -> List[ConceptTypeMeta]:
-    metas_state = head_state["concept_metas"]
-    metas: List[ConceptTypeMeta] = []
-    for item in metas_state:
-        concept_ids = torch.tensor(item["concept_ids"], device=device, dtype=torch.long)
-        eos_id = int(item["eos_id"])
-        concept_ids_with_eos = torch.cat(
-            [concept_ids, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
-        )
-        metas.append(
-            ConceptTypeMeta(
-                name=item["name"],
-                type_id=int(item["type_id"]),
-                eos_id=eos_id,
-                concept_ids=concept_ids,
-                concept_ids_with_eos=concept_ids_with_eos,
-                max_steps=int(item["max_steps"]),
-                target_ratio=float(item["target_ratio"]),
-            )
-        )
-    return metas
+def _build_meta_from_state(head_state: dict, device: str) -> ConceptMeta:
+    item = head_state["concept_meta"]
+    concept_ids = torch.tensor(item["concept_ids"], device=device, dtype=torch.long)
+    eos_id = int(item["eos_id"])
+    concept_ids_with_eos = torch.cat(
+        [concept_ids, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
+    )
+    return ConceptMeta(
+        type_id=int(item["type_id"]),
+        eos_id=eos_id,
+        concept_ids=concept_ids,
+        concept_ids_with_eos=concept_ids_with_eos,
+        max_steps=int(item["max_steps"]),
+        target_ratio=float(item["target_ratio"]),
+    )
 
 
 def load_runtime() -> InferenceRuntime:
@@ -120,8 +114,8 @@ def load_runtime() -> InferenceRuntime:
     assert len(tokenizer) == tokenizer_size, (
         f"Tokenizer size mismatch: tokenizer={len(tokenizer)} vs checkpoint={tokenizer_size}."
     )
-    metas = _build_metas_from_state(head_state, device=device)
-    num_type_embeddings = 1 + len(metas)
+    meta = _build_meta_from_state(head_state, device=device)
+    num_type_embeddings = 2
     base_vocab_size = int(head_state["output_head_base"]["weight"].shape[0])
 
     model_base = _load_backbone_model(
@@ -163,10 +157,10 @@ def load_runtime() -> InferenceRuntime:
     eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
     assert bos_id is not None and eos_id is not None, "Tokenizer must have BOS/EOS token id."
 
-    blocked_ids = build_executor_blocklist(metas, plan_token_id=plan_token_id)
+    blocked_ids = build_executor_blocklist(meta, plan_token_id=plan_token_id)
     vocab_size = model.vocab_size
     mask_cache = ConceptMaskCache(
-        metas=metas,
+        meta=meta,
         vocab_size=vocab_size,
         base_vocab_size=model.base_vocab_size,
         blocked_for_executor=blocked_ids,
@@ -178,7 +172,7 @@ def load_runtime() -> InferenceRuntime:
     return InferenceRuntime(
         model=model,
         tokenizer=tokenizer,
-        metas=metas,
+        meta=meta,
         mask_cache=mask_cache,
         plan_token_id=plan_token_id,
         bos_id=int(bos_id),
@@ -212,15 +206,12 @@ def trim_to_first_eos(token_ids: List[int], eos_id: int) -> List[int]:
 
 def format_concepts(
     tokenizer: AutoTokenizer,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     planner_out,
     sample_idx: int,
 ) -> List[str]:
-    lines: List[str] = []
-    for meta, type_out in zip(metas, planner_out.per_type):
-        valid = type_out.valid_mask[sample_idx].to(torch.bool)
-        ids = type_out.token_ids[sample_idx][valid].tolist()
-        toks = tokenizer.convert_ids_to_tokens(ids)
-        lines.append(f"{meta.name}: ids={ids} tokens={' '.join(toks) if toks else '(empty)'}")
-    return lines
-
+    type_out = planner_out.concept
+    valid = type_out.valid_mask[sample_idx].to(torch.bool)
+    ids = type_out.token_ids[sample_idx][valid].tolist()
+    toks = tokenizer.convert_ids_to_tokens(ids)
+    return [f"concept: ids={ids} tokens={' '.join(toks) if toks else '(empty)'}"]

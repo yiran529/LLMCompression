@@ -124,7 +124,7 @@ class CUDAPrefetcher:
 def save_checkpoint(
     model: SharedBackboneUnifiedHead,
     tokenizer: AutoTokenizer,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     step: int,
     output_dir: str,
     optimizer=None,
@@ -140,17 +140,13 @@ def save_checkpoint(
     model.base_model.save_pretrained(backbone_dir)
     tokenizer.save_pretrained(backbone_dir)
 
-    meta_dump = [
-        {
-            "name": m.name,
-            "type_id": m.type_id,
-            "eos_id": m.eos_id,
-            "concept_ids": m.concept_ids.tolist(),
-            "max_steps": m.max_steps,
-            "target_ratio": m.target_ratio,
-        }
-        for m in metas
-    ]
+    meta_dump = {
+        "type_id": meta.type_id,
+        "eos_id": meta.eos_id,
+        "concept_ids": meta.concept_ids.tolist(),
+        "max_steps": meta.max_steps,
+        "target_ratio": meta.target_ratio,
+    }
 
     planner_quota_state = None
     if hasattr(model, "planner_quota") and model.planner_quota is not None:
@@ -164,7 +160,7 @@ def save_checkpoint(
             "output_head_new": model.output_head_new.state_dict() if model.output_head_new is not None else None,
             "type_embed": model.type_embed.state_dict(),
             "token_embed_new": token_embed_new,
-            "concept_metas": meta_dump,
+            "concept_meta": meta_dump,
             "planner_quota": planner_quota_state,
             "step": step,
             "tokenizer_size": len(tokenizer),
@@ -249,7 +245,7 @@ def _build_wandb_config(
         "lora_modules_to_save": LORA_MODULES_TO_SAVE,
         "resume_enabled": RESUME_ENABLED,
         "resume_checkpoint_dir": RESUME_CHECKPOINT_DIR,
-        "concept_type_configs": [cfg.__dict__ for cfg in CONCEPT_TYPE_CONFIGS],
+        "concept_config": CONCEPT_CONFIG.__dict__,
         "trainable_params": trainable_params,
         "all_params": all_params,
         "output_head_new_rows": new_rows,
@@ -322,8 +318,8 @@ def log_wandb_step_metrics(
     wandb_run,
     global_step: int,
     epoch: int,
-    metas: List[ConceptTypeMeta],
-    avg_lens: List[float],
+    meta: ConceptMeta,
+    avg_len: float,
     avg_loss: float,
     loss: torch.Tensor,
     loss_rec: torch.Tensor,
@@ -365,9 +361,7 @@ def log_wandb_step_metrics(
         "train/tokens_this_step": float(step_tokens),
         "train/epoch": float(epoch + 1),
     }
-    for idx, meta in enumerate(metas):
-        if idx < len(avg_lens):
-            metrics[f"train/type_len/{meta.name}"] = float(avg_lens[idx])
+    metrics["train/concept_len"] = float(avg_len)
     if scaler is not None and scaler.is_enabled():
         metrics["amp/grad_scale"] = float(scaler.get_scale())
     if torch.cuda.is_available():
@@ -429,25 +423,23 @@ def _trim_to_first_eos(token_ids: List[int], eos_id: int) -> List[int]:
 
 def _format_concepts_for_sample(
     tokenizer: AutoTokenizer,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     planner_out: PlannerOutput,
     sample_idx: int,
 ) -> List[str]:
-    lines: List[str] = []
-    for meta, type_out in zip(metas, planner_out.per_type):
-        valid = type_out.valid_mask[sample_idx].to(torch.bool)
-        ids = type_out.token_ids[sample_idx][valid].tolist()
-        toks = tokenizer.convert_ids_to_tokens(ids)
-        tok_text = " ".join(toks) if toks else "(empty)"
-        lines.append(f"{meta.name}: ids={ids} tokens={tok_text}")
-    return lines
+    type_out = planner_out.concept
+    valid = type_out.valid_mask[sample_idx].to(torch.bool)
+    ids = type_out.token_ids[sample_idx][valid].tolist()
+    toks = tokenizer.convert_ids_to_tokens(ids)
+    tok_text = " ".join(toks) if toks else "(empty)"
+    return [f"concept: ids={ids} tokens={tok_text}"]
 
 
 def run_periodic_eval(
     *,
     model: SharedBackboneUnifiedHead,
     tokenizer: AutoTokenizer,
-    metas: List[ConceptTypeMeta],
+    meta: ConceptMeta,
     mask_cache: ConceptMaskCache,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -481,7 +473,7 @@ def run_periodic_eval(
                 plan_token_id=plan_token_id,
                 bos_id=bos_id,
                 eos_id=eos_id,
-                metas=metas,
+                meta=meta,
                 mask_cache=mask_cache,
                 device=device,
                 max_new_tokens=EVAL_MAX_NEW_TOKENS,
@@ -506,7 +498,7 @@ def run_periodic_eval(
 
         concept_lines = _format_concepts_for_sample(
             tokenizer=tokenizer,
-            metas=metas,
+            meta=meta,
             planner_out=infer_out.planner_out,
             sample_idx=i,
         )

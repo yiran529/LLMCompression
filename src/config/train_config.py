@@ -60,6 +60,7 @@ QUOTA_LAMBDA_MAX = 1.0
 
 # 0 is reserved for "normal text / neutral type".
 TYPE_ID_TEXT = 0
+TYPE_ID_CONCEPT = 1
 
 # LoRA
 LORA_R = 16
@@ -82,17 +83,17 @@ RESUME_CHECKPOINT_DIR = ""
 
 
 @dataclass
-class ConceptTypeConfig:
-    name: str
+class ConceptConfig:
     size: int
     max_steps: int
     target_ratio: float
 
 
-CONCEPT_TYPE_CONFIGS = [
-    ConceptTypeConfig(name="bottom", size=1024, max_steps=15, target_ratio=0.25),
-    # ConceptTypeConfig(name="mid", size=256, max_steps=5, target_ratio=0.1), # 暂时不使用中间层概念，以简化训练和调试
-]
+CONCEPT_CONFIG = ConceptConfig(
+    size=1024,
+    max_steps=15,
+    target_ratio=0.25,
+)
 
 
 def apply_runtime_settings() -> None:
