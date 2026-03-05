@@ -103,18 +103,18 @@ def get_stage2_tf_mask_ratio(
 
 def apply_stage2_tf_token_masking(
     *,
-    decoder_in: torch.Tensor,
+    decoder_shape: Tuple[int, int],
     decoder_mask: torch.Tensor,
     global_step: int,
     total_steps: int,
-    mask_token_id: int,
     enabled: bool,
     ratio_max: float,
     ratio_min: float,
 ) -> Tuple[torch.Tensor, float, float]:
-    """apply random token masking on valid stage-2 TF inputs (excluding BOS)."""
+    """sample stage-2 TF mask positions on valid tokens (excluding BOS)."""
+    mask_positions = torch.zeros(decoder_shape, device=decoder_mask.device, dtype=torch.bool)
     if not enabled:
-        return decoder_in, 0.0, 0.0
+        return mask_positions, 0.0, 0.0
 
     target_ratio = get_stage2_tf_mask_ratio(
         global_step=global_step,
@@ -122,27 +122,22 @@ def apply_stage2_tf_token_masking(
         ratio_max=ratio_max,
         ratio_min=ratio_min,
     )
-    if target_ratio <= 0.0:
-        return decoder_in, target_ratio, 0.0
+    assert target_ratio >= 0.0 and target_ratio <= 1.0, "target_ratio must be in [0, 1]"
 
     candidate_mask = decoder_mask.bool().clone()
     if candidate_mask.size(1) > 0:
         candidate_mask[:, 0] = False  # keep BOS unmasked
 
     candidate_count = int(candidate_mask.sum().item())
-    if candidate_count <= 0:
-        return decoder_in, target_ratio, 0.0
 
-    sampled = torch.rand(decoder_in.shape, device=decoder_in.device) < target_ratio
+    sampled = torch.rand(decoder_shape, device=decoder_mask.device) < target_ratio
     mask_positions = candidate_mask & sampled
     masked_count = int(mask_positions.sum().item())
     if masked_count <= 0:
-        return decoder_in, target_ratio, 0.0
+        return mask_positions, target_ratio, 0.0
 
-    masked_decoder_in = decoder_in.clone()
-    masked_decoder_in[mask_positions] = int(mask_token_id)
-    applied_ratio = float(masked_count) / float(candidate_count)
-    return masked_decoder_in, target_ratio, applied_ratio
+    applied_ratio = float(masked_count) / float(candidate_count) if candidate_count > 0 else 0.0
+    return mask_positions, target_ratio, applied_ratio
 
 class CUDAPrefetcher:
     def __init__(self, loader: DataLoader, device: str = "cuda"):
@@ -379,7 +374,7 @@ def compute_concept_diversity_metrics(
     planner_out: PlannerOutput,
     meta: ConceptMeta,
 ) -> Dict[str, float]:
-    """Compute per-sequence and batch-level concept-token diversity (excluding EOS tokens)."""
+    """Compute compact concept-token diversity metrics (excluding EOS tokens)."""
     # Planner output includes padded/finished positions and EOS markers.
     # Only valid non-EOS concept tokens are counted for diversity statistics.
     concept_token_ids = planner_out.concept.token_ids
@@ -402,13 +397,9 @@ def compute_concept_diversity_metrics(
 
     if concept_seq_diversities:
         seq_div_mean = sum(concept_seq_diversities) / float(len(concept_seq_diversities))
-        seq_div_min = min(concept_seq_diversities)
-        seq_div_max = max(concept_seq_diversities)
         seq_unique_mean = sum(concept_seq_unique_counts) / float(len(concept_seq_unique_counts))
     else:
         seq_div_mean = 0.0
-        seq_div_min = 0.0
-        seq_div_max = 0.0
         seq_unique_mean = 0.0
 
     batch_tokens = concept_token_ids[concept_effective_mask]
@@ -422,12 +413,8 @@ def compute_concept_diversity_metrics(
 
     return {
         "train/concept_diversity_seq_mean": seq_div_mean,
-        "train/concept_diversity_seq_min": seq_div_min,
-        "train/concept_diversity_seq_max": seq_div_max,
         "train/concept_seq_unique_count_mean": seq_unique_mean,
         "train/concept_diversity_batch_ratio": batch_div_ratio,
-        "train/concept_batch_unique_count": float(batch_unique_count),
-        "train/concept_batch_token_count": float(batch_token_count),
     }
 
 

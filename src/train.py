@@ -391,13 +391,12 @@ def train():
                     device=device,
                 )
 
-                # augment: optional stage-2 TF input masking with step-wise ratio decay
-                decoder_in, tf_mask_target_ratio, tf_mask_applied_ratio = apply_stage2_tf_token_masking(
-                    decoder_in=decoder_in,
+                # augment: optional stage-2 TF embedding masking with step-wise ratio decay
+                tf_mask_positions, tf_mask_target_ratio, tf_mask_applied_ratio = apply_stage2_tf_token_masking(
+                    decoder_shape=(decoder_in.size(0), decoder_in.size(1)),
                     decoder_mask=decoder_mask,
                     global_step=global_step,
                     total_steps=total_steps,
-                    mask_token_id=eos_id,
                     enabled=ENABLE_STAGE2_TF_MASKING,
                     ratio_max=STAGE2_TF_MASKING_MAX_RATIO,
                     ratio_min=STAGE2_TF_MASKING_MIN_RATIO,
@@ -405,6 +404,18 @@ def train():
 
                 decoder_type_ids = torch.full_like(decoder_in, TYPE_ID_TEXT)
                 decoder_embeds = model.embed_with_type(decoder_in, decoder_type_ids)
+                if ENABLE_STAGE2_TF_MASKING:
+                    # Inject Gaussian noise on masked TF positions instead of zeroing embeddings.
+                    noise_scale = decoder_embeds.detach().float().std(unbiased=False).clamp_min(1e-6)
+                    noise = torch.randn_like(decoder_embeds) * noise_scale.to(
+                        device=decoder_embeds.device,
+                        dtype=decoder_embeds.dtype,
+                    )
+                    decoder_embeds = torch.where(
+                        tf_mask_positions.unsqueeze(-1),
+                        decoder_embeds + noise,
+                        decoder_embeds,
+                    )
 
                 full_embeds = torch.cat([prefix_embeds, decoder_embeds], dim=1)
                 # full_mask 表示“整段输入里哪些 token 是有效上下文，哪些是 padding”
