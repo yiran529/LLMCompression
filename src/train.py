@@ -97,6 +97,12 @@ def train():
         model_base = PeftModel.from_pretrained(model_base, resume_backbone_dir, is_trainable=True).to(device)
     else:
         model_base = get_peft_model(model_base, lora_cfg)
+    
+    # Optional: Gradient Checkpointing to save VRAM
+    if USE_GRADIENT_CHECKPOINTING:
+        model_base.gradient_checkpointing_enable()
+        logging.info("[INFO] gradient checkpointing enabled (planner kv_cache will be disabled)")
+
     model_base.print_trainable_parameters()
 
     # =========================
@@ -355,6 +361,7 @@ def train():
                     min_concept_steps=MIN_CONCEPT_STEPS,
                     base_vocab_size=base_vocab_size,
                     device=device,
+                    use_cache=not USE_GRADIENT_CHECKPOINTING,
                 )
                 stage_metrics.update(cuda_stage_end("planner", planner_stage_state))
 

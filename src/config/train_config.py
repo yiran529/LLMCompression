@@ -7,7 +7,7 @@ import torch
 import torch.backends.cudnn as cudnn
 
 
-USE_COMPILE = True
+USE_COMPILE = False
 COMPILE_MODE = "reduce-overhead"
 
 # A800-friendly defaults
@@ -17,6 +17,9 @@ MODEL_DTYPE = "fp16"
 ATTENTION_IMPL = "sdpa"
 # FP32_TRAINABLE: "none", "lora_only", "all"
 FP32_TRAINABLE = "lora_only"
+
+# Gradient Checkpointing (Saves VRAM but slower training)
+USE_GRADIENT_CHECKPOINTING = False
 
 BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
@@ -45,8 +48,8 @@ ALLOW_PLANNER_BASE_TOKENS = False
 
 LAMBDA_REC = 1.0
 LAMBDA_COMMIT = 0.1
-LAMBDA_UNIF = 0.1
-LAMBDA_EOS = 0.1
+LAMBDA_UNIF = 1.0
+LAMBDA_EOS = 0.2
 LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
 EPS = 1e-8
