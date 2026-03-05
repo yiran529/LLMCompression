@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -85,6 +85,64 @@ def get_adaptive_tau(global_step: int, total_steps: int, tau_init: float, tau_mi
         return tau_init - (tau_init - 0.4) * local
     local = (ratio - 0.6) / 0.4
     return 0.4 - (0.4 - tau_min) * local
+
+
+def get_stage2_tf_mask_ratio(
+    *,
+    global_step: int,
+    total_steps: int,
+    ratio_max: float,
+    ratio_min: float,
+) -> float:
+    """linearly decay stage-2 TF masking ratio from `ratio_max` to `ratio_min`."""
+    hi = max(float(ratio_max), float(ratio_min))
+    lo = min(float(ratio_max), float(ratio_min))
+    progress = min(1.0, max(0.0, float(global_step) / max(1.0, float(total_steps))))
+    return hi - (hi - lo) * progress
+
+
+def apply_stage2_tf_token_masking(
+    *,
+    decoder_in: torch.Tensor,
+    decoder_mask: torch.Tensor,
+    global_step: int,
+    total_steps: int,
+    mask_token_id: int,
+    enabled: bool,
+    ratio_max: float,
+    ratio_min: float,
+) -> Tuple[torch.Tensor, float, float]:
+    """apply random token masking on valid stage-2 TF inputs (excluding BOS)."""
+    if not enabled:
+        return decoder_in, 0.0, 0.0
+
+    target_ratio = get_stage2_tf_mask_ratio(
+        global_step=global_step,
+        total_steps=total_steps,
+        ratio_max=ratio_max,
+        ratio_min=ratio_min,
+    )
+    if target_ratio <= 0.0:
+        return decoder_in, target_ratio, 0.0
+
+    candidate_mask = decoder_mask.bool().clone()
+    if candidate_mask.size(1) > 0:
+        candidate_mask[:, 0] = False  # keep BOS unmasked
+
+    candidate_count = int(candidate_mask.sum().item())
+    if candidate_count <= 0:
+        return decoder_in, target_ratio, 0.0
+
+    sampled = torch.rand(decoder_in.shape, device=decoder_in.device) < target_ratio
+    mask_positions = candidate_mask & sampled
+    masked_count = int(mask_positions.sum().item())
+    if masked_count <= 0:
+        return decoder_in, target_ratio, 0.0
+
+    masked_decoder_in = decoder_in.clone()
+    masked_decoder_in[mask_positions] = int(mask_token_id)
+    applied_ratio = float(masked_count) / float(candidate_count)
+    return masked_decoder_in, target_ratio, applied_ratio
 
 class CUDAPrefetcher:
     def __init__(self, loader: DataLoader, device: str = "cuda"):
@@ -219,6 +277,9 @@ def _build_wandb_config(
         "eval_num_samples": EVAL_NUM_SAMPLES,
         "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
         "eval_planner_tau": EVAL_PLANNER_TAU,
+        "enable_stage2_tf_masking": ENABLE_STAGE2_TF_MASKING,
+        "stage2_tf_masking_max_ratio": STAGE2_TF_MASKING_MAX_RATIO,
+        "stage2_tf_masking_min_ratio": STAGE2_TF_MASKING_MIN_RATIO,
         "seed": SEED,
         "model_dtype": MODEL_DTYPE,
         "attention_impl": ATTENTION_IMPL,

@@ -338,6 +338,8 @@ def train():
             should_profile_step = will_do_step and (global_step % log_every == 0)
             profile_cuda = should_profile_step and torch.cuda.is_available()
             stage_metrics: Dict[str, float] = {}
+            tf_mask_target_ratio = 0.0
+            tf_mask_applied_ratio = 0.0
 
             # ---- [Forward] planner + executor in AMP autocast ----
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=use_amp):
@@ -387,6 +389,18 @@ def train():
                     bos_id=bos_id,
                     eos_id=eos_id,
                     device=device,
+                )
+                
+                # ---- [Augment] optional stage-2 TF input masking with step-wise ratio decay ----
+                decoder_in, tf_mask_target_ratio, tf_mask_applied_ratio = apply_stage2_tf_token_masking(
+                    decoder_in=decoder_in,
+                    decoder_mask=decoder_mask,
+                    global_step=global_step,
+                    total_steps=total_steps,
+                    mask_token_id=eos_id,
+                    enabled=ENABLE_STAGE2_TF_MASKING,
+                    ratio_max=STAGE2_TF_MASKING_MAX_RATIO,
+                    ratio_min=STAGE2_TF_MASKING_MIN_RATIO,
                 )
 
                 decoder_type_ids = torch.full_like(decoder_in, TYPE_ID_TEXT)
@@ -555,6 +569,10 @@ def train():
                     )
                     seq_div_mean = concept_diversity_metrics["train/concept_diversity_seq_mean"]
                     batch_div_ratio = concept_diversity_metrics["train/concept_diversity_batch_ratio"]
+                    step_extra_metrics = dict(concept_diversity_metrics)
+                    if ENABLE_STAGE2_TF_MASKING:
+                        step_extra_metrics["train/stage2_tf_mask_ratio_target"] = tf_mask_target_ratio
+                        step_extra_metrics["train/stage2_tf_mask_ratio_applied"] = tf_mask_applied_ratio
 
                     logging.info(
                         f"[Epoch {epoch + 1}/{EPOCHS}] "
@@ -571,6 +589,7 @@ def train():
                         f"ConceptLen {avg_len:.2f} | "
                         f"SeqDiv {seq_div_mean:.4f} | "
                         f"BatchDiv {batch_div_ratio:.4f} | "
+                        f"TFMask {tf_mask_applied_ratio:.4f} | "
                         f"Tau {tau:.4f} | "
                         f"LR {scheduler.get_last_lr()[0]:.2e} | "
                         f"Tok/s {step_tokens / max(step_wall_time, 1e-9):.1f}"
@@ -599,7 +618,7 @@ def train():
                         step_tokens=step_tokens,
                         scaler=scaler,
                         stage_metrics=stage_metrics,
-                        extra_metrics=concept_diversity_metrics,
+                        extra_metrics=step_extra_metrics,
                     )
 
                 # ---- [Step] periodic eval and checkpoint ----

@@ -530,3 +530,4 @@ g = S(z^**{\text{new}})-S(z^**{\text{old}})
 1. 增加一些调试信息，记录训练时concept tokens的使用情况
 2. input corruption / window / noisy embedding
 3. 利用concept tokens 预测文本的一些全局属性
+4. 不对成lr
