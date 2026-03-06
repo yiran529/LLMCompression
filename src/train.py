@@ -638,7 +638,7 @@ def train():
                     )
 
                 # ---- [Step] periodic eval and checkpoint ----
-                if eval_every > 0 and global_step % eval_every == 0:
+                if eval_every > 0 and global_step % eval_every == 0 or is_last_in_epoch:
                     run_periodic_eval(
                         model=model,
                         tokenizer=tokenizer,
