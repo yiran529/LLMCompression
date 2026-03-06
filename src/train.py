@@ -51,14 +51,40 @@ def train():
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
     tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True)
     special_tokens = build_concept_special_tokens(CONCEPT_CONFIG)
-    added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+
+    token_additions = {"additional_special_tokens": special_tokens}
+    auto_added_core_tokens: Dict[str, str] = {}
+    if tokenizer.bos_token_id is None:
+        auto_added_core_tokens["bos_token"] = "<BOS>"
+    if tokenizer.eos_token_id is None:
+        auto_added_core_tokens["eos_token"] = "<EOS>"
+
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif "eos_token" in auto_added_core_tokens:
+            auto_added_core_tokens["pad_token"] = auto_added_core_tokens["eos_token"]
+        elif tokenizer.bos_token is not None:
+            tokenizer.pad_token = tokenizer.bos_token
+        elif "bos_token" in auto_added_core_tokens:
+            auto_added_core_tokens["pad_token"] = auto_added_core_tokens["bos_token"]
+
+    if auto_added_core_tokens:
+        token_additions.update(auto_added_core_tokens)
+
+    added = tokenizer.add_special_tokens(token_additions)
     logging.info(f"[INFO] added special tokens: {added}")
+    if auto_added_core_tokens:
+        logging.info(f"[INFO] auto-added tokenizer core tokens: {auto_added_core_tokens}")
 
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
-    bos_id = tokenizer.bos_token_id
-    eos_id = tokenizer.eos_token_id
+    if plan_token_id is None or plan_token_id < 0:
+        raise RuntimeError("Tokenizer must include <PLAN> token after special-token setup.")
+
+    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
     if bos_id is None or eos_id is None:
-        raise RuntimeError("Tokenizer must provide BOS/EOS ids.")
+        raise RuntimeError("Tokenizer must provide BOS/EOS ids after fallback token setup.")
 
     # =========================
     # 3) Model dtype + backbone loading

@@ -27,7 +27,7 @@ OUTPUT_DIR = "./outputs"
 
 # Sanity-check mode: set >0 to train on only the first N samples (e.g., 1 or 4).
 # Set to 0 to disable and use the full dataset.
-SANITY_MAX_SAMPLES = 0
+SANITY_MAX_SAMPLES = 1
 
 BATCH_SIZE = 1
 GRAD_ACCUM = 1
