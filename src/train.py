@@ -55,8 +55,8 @@ def train():
     logging.info(f"[INFO] added special tokens: {added}")
 
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
-    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
     if bos_id is None or eos_id is None:
         raise RuntimeError("Tokenizer must provide BOS/EOS ids.")
 
@@ -204,15 +204,19 @@ def train():
     # =========================
     # 8) Dataset and dataloader
     # =========================
-    dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
+    max_samples = SANITY_MAX_SAMPLES if SANITY_MAX_SAMPLES > 0 else None
+    dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=max_samples)
+    if len(dataset) == 0:
+        raise RuntimeError("Dataset is empty after applying SANITY_MAX_SAMPLES; please increase it or check PARQUET_PATH.")
     collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
+    effective_batch_size = min(BATCH_SIZE, len(dataset))
     dataloader_kwargs = {
-        "batch_size": BATCH_SIZE,
+        "batch_size": effective_batch_size,
         "shuffle": True,
         "num_workers": 8,
         "pin_memory": torch.cuda.is_available(),
         "collate_fn": collate_fn,
-        "drop_last": True,
+        "drop_last": len(dataset) >= effective_batch_size,
         "prefetch_factor": 4,
         "persistent_workers": True,
     }

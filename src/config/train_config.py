@@ -7,7 +7,7 @@ import torch
 import torch.backends.cudnn as cudnn
 
 
-USE_COMPILE = False
+USE_COMPILE = True
 COMPILE_MODE = "reduce-overhead"
 
 # A800-friendly defaults
@@ -25,14 +25,18 @@ BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 40
-GRAD_ACCUM = 8
-EPOCHS = 3
+# Sanity-check mode: set >0 to train on only the first N samples (e.g., 1 or 4).
+# Set to 0 to disable and use the full dataset.
+SANITY_MAX_SAMPLES = 0
+
+BATCH_SIZE = 1
+GRAD_ACCUM = 1
+EPOCHS = 500
 LR = 1e-4
 WARMUP_RATIO = 0.1
 MAX_INPUT_TOKENS = 32
 SEED = 42
-SAVE_STEPS = 200
+SAVE_STEPS = 10000
 LOG_STEPS = 5
 EVAL_STEPS = 100
 EVAL_NUM_SAMPLES = 4
@@ -45,7 +49,7 @@ EVAL_SKIP_SPECIAL_TOKENS = True
 # - first 10% steps: keep ratio at MIN
 # - 10%~80% steps: linearly increase MIN -> MAX
 # - last 20% steps: keep ratio at MAX
-ENABLE_STAGE2_TF_MASKING = True
+ENABLE_STAGE2_TF_MASKING = False
 STAGE2_TF_MASKING_MAX_RATIO = 0.15
 STAGE2_TF_MASKING_MIN_RATIO = 0.0
 
@@ -53,7 +57,7 @@ TAU_INIT = 1.0
 TAU_MIN = 0.2
 MIN_CONCEPT_STEPS = 1
 # Planner sampling mode during training: "gumbel" | "greedy" | "mix".
-TRAIN_PLANNER_SAMPLING_MODE = "mix"
+TRAIN_PLANNER_SAMPLING_MODE = "greedy"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.9
@@ -62,7 +66,7 @@ ALLOW_PLANNER_BASE_TOKENS = False
 
 LAMBDA_REC = 1.0
 LAMBDA_COMMIT = 0.1
-LAMBDA_UNIF = 1.0
+LAMBDA_UNIF = 0.0
 LAMBDA_EOS = 0.2
 LAMBDA_LEN = 0.2
 BETA_COMMIT = 0.5
@@ -79,7 +83,7 @@ TYPE_ID_CONCEPT = 1
 # LoRA
 LORA_R = 16
 LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
+LORA_DROPOUT = 0.0
 LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -131,5 +135,5 @@ apply_runtime_settings()
 
 ############# wandb config #############
 WANDB_PROJECT = "token-compression"
-WANDB_RUN_NAME = "b99778c"
+WANDB_RUN_NAME = "sanity_check"
 WANDB_ENTITY = ""
