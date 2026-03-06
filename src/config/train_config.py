@@ -41,9 +41,12 @@ EVAL_PLANNER_TAU = 0.2
 EVAL_SKIP_SPECIAL_TOKENS = True
 
 # Stage-2 teacher-forcing input masking.
-# Linear decay: ratio goes from MAX -> MIN as training step increases.
+# Schedule:
+# - first 10% steps: keep ratio at MIN
+# - 10%~80% steps: linearly increase MIN -> MAX
+# - last 20% steps: keep ratio at MAX
 ENABLE_STAGE2_TF_MASKING = True
-STAGE2_TF_MASKING_MAX_RATIO = 0.5
+STAGE2_TF_MASKING_MAX_RATIO = 0.15
 STAGE2_TF_MASKING_MIN_RATIO = 0.0
 
 TAU_INIT = 1.0
@@ -53,7 +56,7 @@ MIN_CONCEPT_STEPS = 1
 TRAIN_PLANNER_SAMPLING_MODE = "mix"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
-TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.7
+TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.9
 # 是否允许 Planner 输出 base tokens（原词表 tokens）
 ALLOW_PLANNER_BASE_TOKENS = False
 
@@ -128,5 +131,5 @@ apply_runtime_settings()
 
 ############# wandb config #############
 WANDB_PROJECT = "token-compression"
-WANDB_RUN_NAME = ""
+WANDB_RUN_NAME = "b99778c"
 WANDB_ENTITY = ""

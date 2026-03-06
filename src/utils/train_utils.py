@@ -108,27 +108,34 @@ def get_stage2_tf_mask_ratio(
     ratio_max: float,
     ratio_min: float,
 ) -> float:
-    """linearly decay stage-2 TF masking ratio from `ratio_max` to `ratio_min`."""
-    hi = max(float(ratio_max), float(ratio_min))
+    """piecewise schedule for stage-2 TF corruption ratio."""
     lo = min(float(ratio_max), float(ratio_min))
+    hi = max(float(ratio_max), float(ratio_min))
     progress = min(1.0, max(0.0, float(global_step) / max(1.0, float(total_steps))))
-    return hi - (hi - lo) * progress
+
+    if progress <= 0.10:
+        return lo
+    if progress >= 0.80:
+        return hi
+    local = (progress - 0.10) / 0.70
+    return lo + (hi - lo) * local
 
 
 def apply_stage2_tf_token_masking(
     *,
-    decoder_shape: Tuple[int, int],
+    decoder_in: torch.Tensor,
     decoder_mask: torch.Tensor,
     global_step: int,
     total_steps: int,
     enabled: bool,
     ratio_max: float,
     ratio_min: float,
+    random_token_upper_bound: int,
 ) -> Tuple[torch.Tensor, float, float]:
-    """sample stage-2 TF mask positions on valid tokens (excluding BOS)."""
-    mask_positions = torch.zeros(decoder_shape, device=decoder_mask.device, dtype=torch.bool)
+    """apply stage-2 decoder corruption with random-token replacement."""
+    corrupted_decoder_in = decoder_in
     if not enabled:
-        return mask_positions, 0.0, 0.0
+        return corrupted_decoder_in, 0.0, 0.0
 
     target_ratio = get_stage2_tf_mask_ratio(
         global_step=global_step,
@@ -136,22 +143,33 @@ def apply_stage2_tf_token_masking(
         ratio_max=ratio_max,
         ratio_min=ratio_min,
     )
-    assert target_ratio >= 0.0 and target_ratio <= 1.0, "target_ratio must be in [0, 1]"
+    assert 0.0 <= target_ratio <= 1.0, "target_ratio must be in [0, 1]"
 
+    corrupted_decoder_in = decoder_in.clone()
     candidate_mask = decoder_mask.bool().clone()
     if candidate_mask.size(1) > 0:
         candidate_mask[:, 0] = False  # keep BOS unmasked
 
-    candidate_count = int(candidate_mask.sum().item())
+    sampled = torch.rand(decoder_in.shape, device=decoder_in.device) < target_ratio
+    corrupt_positions = candidate_mask & sampled
 
-    sampled = torch.rand(decoder_shape, device=decoder_mask.device) < target_ratio
-    mask_positions = candidate_mask & sampled
-    masked_count = int(mask_positions.sum().item())
+    candidate_count = int(candidate_mask.sum().item())
+    masked_count = int(corrupt_positions.sum().item())
     if masked_count <= 0:
-        return mask_positions, target_ratio, 0.0
+        return corrupted_decoder_in, target_ratio, 0.0
+
+    upper = max(1, int(random_token_upper_bound))
+    random_tokens = torch.randint(
+        low=0,
+        high=upper,
+        size=decoder_in.shape,
+        device=decoder_in.device,
+        dtype=decoder_in.dtype,
+    )
+    corrupted_decoder_in[corrupt_positions] = random_tokens[corrupt_positions]
 
     applied_ratio = float(masked_count) / float(candidate_count) if candidate_count > 0 else 0.0
-    return mask_positions, target_ratio, applied_ratio
+    return corrupted_decoder_in, target_ratio, applied_ratio
 
 class CUDAPrefetcher:
     def __init__(self, loader: DataLoader, device: str = "cuda"):

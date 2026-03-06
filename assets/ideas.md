@@ -530,4 +530,47 @@ g = S(z^**{\text{new}})-S(z^**{\text{old}})
 1. 增加一些调试信息，记录训练时concept tokens的使用情况
 2. input corruption / window / noisy embedding
 3. 利用concept tokens 预测文本的一些全局属性
-4. 不对成lr
+4. 不对称lr
+
+# 训练时gumbel + greedy混合，noisy embedding, 且降低tau_min (b99778c0a93f6e653c33ab44fdf843d55aebbe60)
+## 变好：
+1. concept序列基本不会重复
+2. 同一个concept序列中不太会出现重复的concept tokens
+## 仍然不好：
+1. 重建效果还是很糟，几乎没有还原原意
+2. 还是有一点点同一个concept序列中会出现个别重复的concept tokens
+## 其他观察
+1. loss_unif从之前的1+降到0.25-
+2. loss_rec可以降低到3左右
+3. loss_eos降到0.03左右
+4. loss_commit逐渐走高，到8e-6左右
+5. 训练时concept diversity逐渐走低，unique率到大概0.75左右
+## 例子（900steps）
+
+797 - INFO - [Eval Step 900] Sample 0
+797 - INFO - Input: Iran also launched several retaliatory air raids on Iraq, while primarily shelling border cities such as Basra. Iran also bought some Scud missiles from Libya,
+797 - INFO - Concepts:
+798 - INFO -   concept: ids=[152446, 151680, 152050, 152656, 152656, 151680, 151680, 151671, 151670] tokens=<C_775> <C_9> <C_379> <C_985> <C_985> <C_9> <C_9> <C_0> <EOS_CONCEPT>
+798 - INFO - Output: The 1960s saw the rise of the "new" American cinema, which was characterized by a more realistic and realistic portrayal of American life.
+810 - INFO - ====================================================================================================
+816 - INFO - [Eval Step 900] Sample 1
+817 - INFO - Input: London has played a significant role in the film industry. Major studios within or bordering London include Twickenham, Ealing, Shepperton, Pinewood
+818 - INFO - Concepts:
+818 - INFO -   concept: ids=[152446, 151680, 152022, 152022, 152351, 152406, 151680, 152598, 151670] tokens=<C_775> <C_9> <C_351> <C_351> <C_680> <C_735> <C_9> <C_927> <EOS_CONCEPT>
+819 - INFO - Output: The first major change in the game was the introduction of the "Bingo" mode, which was introduced in 1999. This mode was a
+821 - INFO - ====================================================================================================
+821 - INFO - [Eval Step 900] Sample 2
+822 - INFO - Input: The industry reached its peak in the 1920s employing around 18,000 people. In modern times however the textile industry declined
+823 - INFO - Concepts:
+823 - INFO -   concept: ids=[152535, 152637, 151680, 152050, 152662, 152245, 151680, 152598, 151670] tokens=<C_864> <C_966> <C_9> <C_379> <C_991> <C_574> <C_9> <C_927> <EOS_CONCEPT>
+824 - INFO - Output: The 2010 census showed that 10.6% of the population was of European descent, 12.6% of the population
+826 - INFO - ====================================================================================================
+826 - INFO - [Eval Step 900] Sample 3
+826 - INFO - Input: Spider-Gwen
+Captain America is a S.H.I.E.L.D. agent on Earth-65, who apprehends Spider-Gwen during her battle with
+827 - INFO - Concepts:
+828 - INFO -   concept: ids=[152065, 152155, 152308, 152308, 152624, 152624, 152624, 151671, 151670] tokens=<C_394> <C_484> <C_637> <C_637> <C_953> <C_953> <C_953> <C_0> <EOS_CONCEPT>
+828 - INFO - Output: History
+Early history
+The earliest known reference to the city of Alexandria is found in the 1st century BC, in the writings of the Egyptian historian P
+
