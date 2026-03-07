@@ -366,6 +366,9 @@ def plan_concepts(
     use_cache: bool = True,
 ) -> PlannerOutput:
     """generate one variable-length concept sequence from source input."""
+    # =========================================================================
+    # 1. 基础变量初始化与提取
+    # =========================================================================
     bsz, _ = input_ids.shape
     hidden_size = model.hidden_size
     dtype_embed = model.token_embed_base.weight.dtype
@@ -374,6 +377,9 @@ def plan_concepts(
     bos_id = meta.bos_id
     plan_token_id = meta.plan_token_id
 
+    # =========================================================================
+    # 2. 构造 Planner 的输入序列：[BOS] + Source Text + [PLAN]
+    # =========================================================================
     bos_col = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
     plan_col = torch.full((bsz, 1), plan_token_id, device=device, dtype=torch.long)
     planner_input_ids = torch.cat([bos_col, input_ids, plan_col], dim=1)
@@ -389,6 +395,9 @@ def plan_concepts(
     planner_pos = torch.cumsum(planner_mask, dim=1) - 1
     planner_pos = planner_pos.clamp(min=0)
 
+    # =========================================================================
+    # 3. 初始前向传播 (Backbone)：获取 <PLAN> token 的隐状态与初始 KV Cache
+    # =========================================================================
     planner_embeds = model.embed_with_type(planner_input_ids, planner_type_ids)
     out = model.forward_backbone(
         inputs_embeds=planner_embeds,
@@ -408,6 +417,9 @@ def plan_concepts(
         )
     past_kv = out.past_key_values
 
+    # =========================================================================
+    # 4. 计算目标生成长度与初始化各种 Loss 统计量
+    # =========================================================================
     ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
     src_lengths = attention_mask.sum(dim=1).to(torch.long)
     expected = (src_lengths.float() * meta.target_concept_ratio).long().clamp(min=1, max=meta.max_concept_steps)
@@ -418,6 +430,9 @@ def plan_concepts(
     eos_sum = torch.zeros((), device=device, dtype=torch.float32)
     eos_count = torch.zeros((), device=device, dtype=torch.float32)
 
+    # =========================================================================
+    # 5. 初始化自回归 (AR) 生成所需的状态容器
+    # =========================================================================
     concept_table = model.embed_tokens(meta.concept_ids_with_eos)  # [K+1, H]
     type_vec = model.type_embed.weight[int(meta.type_id_concept)].view(1, -1).to(dtype=dtype_embed)
 
@@ -429,11 +444,17 @@ def plan_concepts(
     cache_attention_mask = planner_mask
     cache_position_ids = planner_pos[:, -1:].clone() + 1
 
+    # =========================================================================
+    # 6. 自回归循环：逐步生成 Concept Tokens
+    # =========================================================================
     for step in range(meta.max_concept_steps):
         active = ~finished
         if not torch.any(active):
             break
 
+        # =====================================================================
+        # 6.1 处理边界条件：屏蔽无效 Token 并强制控制输出长度
+        # =====================================================================
         masked_logits = logits_t.float().clone()
         if torch.any(~active):
             masked_logits[~active] = -1e4
@@ -446,6 +467,9 @@ def plan_concepts(
             forced[:, eos_local_id] = 0.0
             masked_logits[active] = forced
 
+        # =====================================================================
+        # 6.2 Token 采样 (Gumbel-Softmax / Greedy / Mix)
+        # =====================================================================
         probs, sampled_ids_local = _select_planner_tokens(
             masked_logits=masked_logits,
             tau=tau,
@@ -453,14 +477,12 @@ def plan_concepts(
             mix_greedy_ratio=mix_greedy_ratio,
         )
 
-        # Assert: sampled_ids_local 必须在 [0, K] 范围内
         assert torch.all(sampled_ids_local >= 0) and torch.all(sampled_ids_local < meta.planner_vocab_size), (
             f"sampled_ids_local out of range at step {step}: "
             f"got [{sampled_ids_local.min().item()}, {sampled_ids_local.max().item()}], "
             f"expected [0, {meta.planner_vocab_size - 1}]"
         )
 
-        # 将 local ids (0..K) 转换为 global vocab ids
         sampled_ids = meta.concept_local_to_global(sampled_ids_local)
 
         sampled_ids = torch.where(
@@ -472,6 +494,9 @@ def plan_concepts(
         concept_tokens[active, step] = sampled_ids[active]
         concept_valid[active, step] = 1
 
+        # =====================================================================
+        # 6.3 统计与计算当前步的 Loss (CommitLoss, 词频KL, EOS Loss等)
+        # =====================================================================
         active_rows = active.nonzero(as_tuple=False).squeeze(1)
         probs_subset = probs[active_rows]  # [N, K+1]
         hist_sum = hist_sum + probs_subset[:, :-1].sum(dim=0)
@@ -492,6 +517,9 @@ def plan_concepts(
         )
         eos_count = eos_count + eos_target.numel()
 
+        # =====================================================================
+        # 6.4 构造用于下一步自回归的 Straight-Through (ST) 嵌入向量
+        # =====================================================================
         concept_st_embeds = concept_st_embeds.index_put(
             (active_rows, torch.full_like(active_rows, step)),
             st_t,
@@ -510,6 +538,10 @@ def plan_concepts(
             soft_embed_step[~active] = hard_embed_step[~active]
 
         st_embed = hard_embed_step + (soft_embed_step - soft_embed_step.detach())  # [B, H]
+        
+        # =====================================================================
+        # 6.5 执行下一次前向传播，更新 KV Cache 与 Logits
+        # =====================================================================
         cache_attention_mask = torch.cat(
             [cache_attention_mask, torch.ones((bsz, 1), device=device, dtype=torch.long)],
             dim=1
@@ -526,6 +558,9 @@ def plan_concepts(
         logits_t = model.planner_forward_head(out_next.last_hidden_state[:, -1, :])  # [B, K+1]
         past_kv = out_next.past_key_values
 
+    # =========================================================================
+    # 7. 汇总输出结果并合并计算全局 Loss
+    # =========================================================================
     actual_lengths = concept_valid.sum(dim=1)
     concept_out = PlannerTypeOutput(
         token_ids=concept_tokens,
