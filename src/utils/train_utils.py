@@ -209,7 +209,7 @@ class CUDAPrefetcher:
 def save_checkpoint(
     model: SharedBackboneUnifiedHead,
     tokenizer: AutoTokenizer,
-    meta: ConceptMeta,
+    meta: TokenMeta,
     step: int,
     output_dir: str,
     optimizer=None,
@@ -233,10 +233,6 @@ def save_checkpoint(
         "target_ratio": meta.target_ratio,
     }
 
-    planner_quota_state = None
-    if hasattr(model, "planner_quota") and model.planner_quota is not None:
-        planner_quota_state = model.planner_quota.state_dict()
-
     token_embed_new = model.get_new_token_embed_weight().detach().cpu()
 
     torch.save(
@@ -246,7 +242,6 @@ def save_checkpoint(
             "type_embed": model.type_embed.state_dict(),
             "token_embed_new": token_embed_new,
             "concept_meta": meta_dump,
-            "planner_quota": planner_quota_state,
             "step": step,
             "tokenizer_size": len(tokenizer),
         },
@@ -325,10 +320,6 @@ def _build_wandb_config(
         "lambda_unif": LAMBDA_UNIF,
         "lambda_eos": LAMBDA_EOS,
         "lambda_len": LAMBDA_LEN,
-        "quota_tau": QUOTA_TAU,
-        "quota_eta": QUOTA_ETA,
-        "quota_lambda_init": QUOTA_LAMBDA_INIT,
-        "quota_lambda_max": QUOTA_LAMBDA_MAX,
         "lora_r": LORA_R,
         "lora_alpha": LORA_ALPHA,
         "lora_dropout": LORA_DROPOUT,
@@ -407,14 +398,14 @@ def finish_wandb_run(wandb_run, *, total_seconds: int, final_global_step: int) -
 def compute_concept_diversity_metrics(
     *,
     planner_out: PlannerOutput,
-    meta: ConceptMeta,
+    meta: TokenMeta,
 ) -> Dict[str, float]:
     """Compute compact concept-token diversity metrics (excluding EOS tokens)."""
     # Planner output includes padded/finished positions and EOS markers.
     # Only valid non-EOS concept tokens are counted for diversity statistics.
     concept_token_ids = planner_out.concept.token_ids
     concept_valid_mask = planner_out.concept.valid_mask.bool()
-    concept_effective_mask = concept_valid_mask & concept_token_ids.ne(meta.eos_id)
+    concept_effective_mask = concept_valid_mask & concept_token_ids.ne(meta.concept_eos_id)
 
     concept_seq_diversities: List[float] = []
     concept_seq_unique_counts: List[float] = []
@@ -458,7 +449,7 @@ def log_wandb_step_metrics(
     wandb_run,
     global_step: int,
     epoch: int,
-    meta: ConceptMeta,
+    meta: TokenMeta,
     avg_len: float,
     avg_loss: float,
     loss: torch.Tensor,
@@ -467,9 +458,6 @@ def log_wandb_step_metrics(
     loss_unif: torch.Tensor,
     loss_eos: torch.Tensor,
     loss_len: torch.Tensor,
-    loss_quota: torch.Tensor,
-    quota_bar: torch.Tensor,
-    quota_lambda: torch.Tensor,
     grad_norm: torch.Tensor,
     tau: float,
     lr: float,
@@ -491,9 +479,6 @@ def log_wandb_step_metrics(
         "train/loss_unif": float(loss_unif.detach().cpu()),
         "train/loss_eos": float(loss_eos.detach().cpu()),
         "train/loss_len": float(loss_len.detach().cpu()),
-        "train/loss_quota": float(loss_quota.detach().cpu()),
-        "train/quota_bar": float(quota_bar.detach().cpu()),
-        "train/quota_lambda": float(quota_lambda.detach().cpu()),
         "train/grad_norm": float(grad_norm.detach().cpu()),
         "train/tau": float(tau),
         "train/lr": float(lr),
@@ -566,7 +551,7 @@ def _trim_to_first_eos(token_ids: List[int], eos_id: int) -> List[int]:
 
 def _format_concepts_for_sample(
     tokenizer: AutoTokenizer,
-    meta: ConceptMeta,
+    meta: TokenMeta,
     planner_out: PlannerOutput,
     sample_idx: int,
 ) -> List[str]:
@@ -582,13 +567,9 @@ def run_periodic_eval(
     *,
     model: SharedBackboneUnifiedHead,
     tokenizer: AutoTokenizer,
-    meta: ConceptMeta,
-    mask_cache: ConceptMaskCache,
+    meta: TokenMeta,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    plan_token_id: int,
-    bos_id: int,
-    eos_id: int,
     device: str,
     global_step: int,
     wandb_run,
@@ -613,11 +594,7 @@ def run_periodic_eval(
                 model,
                 input_ids=eval_input_ids,
                 attention_mask=eval_attention_mask,
-                plan_token_id=plan_token_id,
-                bos_id=bos_id,
-                eos_id=eos_id,
                 meta=meta,
-                mask_cache=mask_cache,
                 device=device,
                 max_new_tokens=EVAL_MAX_NEW_TOKENS,
                 planner_tau=EVAL_PLANNER_TAU,
@@ -636,7 +613,7 @@ def run_periodic_eval(
 
         gen_len = int(infer_out.lengths[i].item())
         gen_ids = infer_out.generated_ids[i, :gen_len].tolist()
-        gen_ids = _trim_to_first_eos(gen_ids, eos_id)
+        gen_ids = _trim_to_first_eos(gen_ids, meta.eos_id)
         out_text = tokenizer.decode(gen_ids, skip_special_tokens=EVAL_SKIP_SPECIAL_TOKENS)
 
         concept_lines = _format_concepts_for_sample(

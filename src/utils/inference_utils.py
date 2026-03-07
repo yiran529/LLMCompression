@@ -13,11 +13,7 @@ from src.model import *
 class InferenceRuntime:
     model: SharedBackboneUnifiedHead
     tokenizer: AutoTokenizer
-    meta: ConceptMeta
-    mask_cache: ConceptMaskCache
-    plan_token_id: int
-    bos_id: int
-    eos_id: int
+    meta: TokenMeta
     device: str
 
 
@@ -80,20 +76,54 @@ def _load_backbone_model(
     return AutoModelForCausalLM.from_pretrained(backbone_dir, **model_kwargs).to(device)
 
 
-def _build_meta_from_state(head_state: dict, device: str) -> ConceptMeta:
+def _build_meta_from_state(head_state: dict, tokenizer: AutoTokenizer, device: str) -> TokenMeta:
+    """从 checkpoint 中恢复 TokenMeta，并添加额外的 token IDs"""
     item = head_state["concept_meta"]
+    vocab_size = len(tokenizer)
+    
+    # 从 checkpoint 恢复 concept IDs
     concept_ids = torch.tensor(item["concept_ids"], device=device, dtype=torch.long)
-    eos_id = int(item["eos_id"])
-    concept_ids_with_eos = torch.cat(
-        [concept_ids, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
+    concept_eos_id = int(item["eos_id"])
+    
+    # Assert: checkpoint 中的 concept IDs 必须在有效范围内
+    assert torch.all(concept_ids >= 0) and torch.all(concept_ids < vocab_size), (
+        f"concept_ids from checkpoint out of range: "
+        f"got [{concept_ids.min().item()}, {concept_ids.max().item()}], vocab_size={vocab_size}"
     )
-    return ConceptMeta(
-        type_id=int(item["type_id"]),
-        eos_id=eos_id,
+    assert 0 <= concept_eos_id < vocab_size, (
+        f"concept_eos_id from checkpoint out of range: {concept_eos_id}, vocab_size={vocab_size}"
+    )
+    
+    concept_ids_with_eos = torch.cat(
+        [concept_ids, torch.tensor([concept_eos_id], device=device, dtype=torch.long)], dim=0
+    )
+    
+    # 从 tokenizer 获取基础 token IDs
+    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
+    
+    # Assert: tokenizer 中的基础 token IDs 必须有效
+    assert bos_id is not None and 0 <= bos_id < vocab_size, f"Invalid bos_id: {bos_id}"
+    assert eos_id is not None and 0 <= eos_id < vocab_size, f"Invalid eos_id: {eos_id}"
+    assert pad_id is not None and 0 <= pad_id < vocab_size, f"Invalid pad_id: {pad_id}"
+    assert plan_token_id is not None and 0 <= plan_token_id < vocab_size, (
+        f"Invalid plan_token_id: {plan_token_id}. Ensure <PLAN> is in tokenizer."
+    )
+    
+    return TokenMeta(
+        bos_id=int(bos_id),
+        eos_id=int(eos_id),
+        pad_id=int(pad_id),
+        plan_token_id=int(plan_token_id),
+        concept_eos_id=concept_eos_id,
         concept_ids=concept_ids,
         concept_ids_with_eos=concept_ids_with_eos,
-        max_steps=int(item["max_steps"]),
-        target_ratio=float(item["target_ratio"]),
+        type_id_text=TYPE_ID_TEXT,
+        type_id_concept=int(item["type_id"]),
+        max_concept_steps=int(item["max_steps"]),
+        target_concept_ratio=float(item["target_ratio"]),
     )
 
 
@@ -114,7 +144,7 @@ def load_runtime() -> InferenceRuntime:
     assert len(tokenizer) == tokenizer_size, (
         f"Tokenizer size mismatch: tokenizer={len(tokenizer)} vs checkpoint={tokenizer_size}."
     )
-    meta = _build_meta_from_state(head_state, device=device)
+    meta = _build_meta_from_state(head_state, tokenizer, device=device)
     num_type_embeddings = 2
     base_vocab_size = int(head_state["output_head_base"]["weight"].shape[0])
 
@@ -130,10 +160,17 @@ def load_runtime() -> InferenceRuntime:
         model_base,
         num_type_embeddings=num_type_embeddings,
         frozen_output_head_prefix_rows=base_vocab_size,
+        meta=meta,
     ).to(device)
 
     model.output_head_base.load_state_dict(head_state["output_head_base"])
     if model.output_head_new is not None:
+        saved_new_weight = head_state["output_head_new"]["weight"]
+        target_rows = model.output_head_new.weight.shape[0]
+        assert saved_new_weight.shape[0] == target_rows, (
+            f"output_head_new rows mismatch: ckpt={saved_new_weight.shape[0]} vs expected={target_rows}. "
+            "Please use a checkpoint trained with the same concept vocabulary size."
+        )
         model.output_head_new.load_state_dict(head_state["output_head_new"])
     model.type_embed.load_state_dict(head_state["type_embed"])
     token_embed_new = head_state.get("token_embed_new")
@@ -150,33 +187,13 @@ def load_runtime() -> InferenceRuntime:
     else:
         print("[WARN] `token_embed_new` not found in two_stage_heads.pt; new token embeddings may be random.")
 
-    plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
-    assert plan_token_id is not None and plan_token_id >= 0, "Tokenizer does not contain `<PLAN>` token."
-
-    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
-    assert bos_id is not None and eos_id is not None, "Tokenizer must have BOS/EOS token id."
-
-    blocked_ids = build_executor_blocklist(meta, plan_token_id=plan_token_id)
     vocab_size = model.vocab_size
-    mask_cache = ConceptMaskCache(
-        meta=meta,
-        vocab_size=vocab_size,
-        base_vocab_size=model.base_vocab_size,
-        blocked_for_executor=blocked_ids,
-        device=device,
-        allow_base_tokens=ALLOW_PLANNER_BASE_TOKENS,
-    )
     model.eval()
 
     return InferenceRuntime(
         model=model,
         tokenizer=tokenizer,
         meta=meta,
-        mask_cache=mask_cache,
-        plan_token_id=plan_token_id,
-        bos_id=int(bos_id),
-        eos_id=int(eos_id),
         device=device,
     )
 
@@ -206,7 +223,7 @@ def trim_to_first_eos(token_ids: List[int], eos_id: int) -> List[int]:
 
 def format_concepts(
     tokenizer: AutoTokenizer,
-    meta: ConceptMeta,
+    meta: TokenMeta,
     planner_out,
     sample_idx: int,
 ) -> List[str]:

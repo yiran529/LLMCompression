@@ -54,12 +54,6 @@ def train():
     added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     logging.info(f"[INFO] added special tokens: {added}")
 
-    plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
-    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
-    if bos_id is None or eos_id is None:
-        raise RuntimeError("Tokenizer must provide BOS/EOS ids.")
-
     # =========================
     # 3) Model dtype + backbone loading
     # =========================
@@ -108,25 +102,27 @@ def train():
     # =========================
     # 5) Build unified model and optional resume head states
     # =========================
-    meta = build_concept_meta(tokenizer, CONCEPT_CONFIG, device=device)
+    # 构建统一的 TokenMeta，管理所有 token ID
+    meta = build_token_meta(tokenizer, CONCEPT_CONFIG, device=device)
     num_type_embeddings = 2
     model = SharedBackboneUnifiedHead(
         model_base,
         num_type_embeddings=num_type_embeddings,
         frozen_output_head_prefix_rows=base_vocab_size,
+        meta=meta,
     ).to(device)
-    model.planner_quota = PlannerQuotaController(
-        tau=QUOTA_TAU,
-        eta=QUOTA_ETA,
-        lambda_init=QUOTA_LAMBDA_INIT,
-        lambda_max=QUOTA_LAMBDA_MAX,
-        device=device,
-    )
     if RESUME_ENABLED:
         head_state = torch.load(resume_heads_path, map_location=device)
         if "output_head_base" in head_state:
             model.output_head_base.load_state_dict(head_state["output_head_base"])
             if model.output_head_new is not None and head_state.get("output_head_new") is not None:
+                saved_new_weight = head_state["output_head_new"]["weight"]
+                target_rows = model.output_head_new.weight.shape[0]
+                if saved_new_weight.shape[0] != target_rows:
+                    raise RuntimeError(
+                        f"output_head_new rows mismatch: ckpt={saved_new_weight.shape[0]} vs expected={target_rows}. "
+                        "Please use a checkpoint trained with the same concept vocabulary size."
+                    )
                 model.output_head_new.load_state_dict(head_state["output_head_new"])
         else:
             raise RuntimeError("No output head state found in checkpoint.")
@@ -142,8 +138,6 @@ def train():
                 device=device,
                 dtype=model.token_embed_new.weight.dtype,
             ))
-        if "planner_quota" in head_state and head_state["planner_quota"] is not None:
-            model.planner_quota.load_state_dict(head_state["planner_quota"], device=device)
         saved_step = head_state.get("step", 0)
         if isinstance(saved_step, int):
             resume_step = saved_step
@@ -177,7 +171,6 @@ def train():
     if USE_COMPILE:
         try:
             compiled = torch.compile(model, mode=COMPILE_MODE, fullgraph=False)
-            compiled.planner_quota = model.planner_quota
             model = compiled
             logging.info(f"[INFO] torch.compile enabled ({COMPILE_MODE})")
         except Exception as e:
@@ -186,19 +179,7 @@ def train():
     # =========================
     # 7) Build masks
     # =========================
-    blocked_ids = build_executor_blocklist(
-        meta,
-        plan_token_id=plan_token_id,
-    )
     vocab_size = model_base.get_input_embeddings().num_embeddings
-    mask_cache = ConceptMaskCache(
-        meta=meta,
-        vocab_size=vocab_size,
-        base_vocab_size=base_vocab_size,
-        blocked_for_executor=blocked_ids,
-        device=device,
-        allow_base_tokens=ALLOW_PLANNER_BASE_TOKENS,
-    )
     logging.info(f"[INFO] Model and tokenizer initialized. Starting data loading...")
 
     # =========================
@@ -275,12 +256,12 @@ def train():
         
 
     logging.info(f"[INFO] vocab size: {vocab_size}")
-    logging.info(f"[INFO] output_head frozen rows: [0, {base_vocab_size})")
-    new_rows = max(0, vocab_size - base_vocab_size)
+    logging.info(f"[INFO] output_head frozen rows: 0, {base_vocab_size})")
+    new_rows = int(model.output_head_new.weight.shape[0]) if model.output_head_new is not None else 0
     effective_head_params = new_rows * model.hidden_size
     logging.info(
-        f"[INFO] output_head trainable rows: [{base_vocab_size}, {vocab_size}) "
-        f"({new_rows} rows, {effective_head_params:,} params)"
+        f"[INFO] planner head trainable rows: {new_rows} "
+        f"({effective_head_params:,} params)"
     )
     logging.info("[INFO] concept type: single")
     logging.info(f"[INFO] steps: total={total_steps}, warmup={warmup_steps}")
@@ -365,15 +346,11 @@ def train():
                     model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    plan_token_id=plan_token_id,
-                    bos_id=bos_id,
                     meta=meta,
-                    mask_cache=mask_cache,
                     tau=tau,
                     sampling_mode=TRAIN_PLANNER_SAMPLING_MODE,
                     mix_greedy_ratio=planner_mix_greedy_ratio,
                     min_concept_steps=MIN_CONCEPT_STEPS,
-                    base_vocab_size=base_vocab_size,
                     device=device,
                     use_cache=not USE_GRADIENT_CHECKPOINTING,
                 )
@@ -391,15 +368,14 @@ def train():
                     model,
                     planner_out=planner_out,
                     meta=meta,
-                    bos_id=bos_id,
                     device=device,
                 )
 
                 decoder_in, decoder_mask, labels, _ = build_decoder_tensors(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    bos_id=bos_id,
-                    eos_id=eos_id,
+                    bos_id=meta.bos_id,
+                    eos_id=meta.eos_id,
                     device=device,
                 )
 
@@ -439,26 +415,18 @@ def train():
                     use_cache=False,
                 )
                 hidden = out.last_hidden_state[:, prefix_embeds.size(1) :, :]
-                logits = model.forward_head(hidden)
-                # Executor should not produce planner-only tokens.
-                logits = logits.masked_fill(mask_cache.executor_block_bool.view(1, 1, -1), -1e4)
+                logits = model.executor_forward_head(hidden)
 
                 loss_rec = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     labels.reshape(-1),
                     ignore_index=-100,
                 )
-                loss_quota, quota_bar = compute_planner_quota_loss(
-                    planner_out=planner_out,
-                    quota_controller=model.planner_quota,
-                )
-
                 loss = (
                     LAMBDA_REC * loss_rec
                     + LAMBDA_COMMIT * loss_commit
                     + LAMBDA_UNIF * loss_unif
                     + LAMBDA_EOS * loss_eos
-                    + loss_quota
                 ).float()
                 stage_metrics.update(cuda_stage_end("execute", execute_stage_state))
 
@@ -598,9 +566,6 @@ def train():
                         f"Unif {float(loss_unif.detach().cpu()):.4f} | "
                         f"EOS {float(loss_eos.detach().cpu()):.4f} | "
                         f"Len {float(loss_len.detach().cpu()):.4f} | "
-                        f"Quota {float(loss_quota.detach().cpu()):.4f} | "
-                        f"QuotaBar {float(quota_bar.detach().cpu()):.4f} | "
-                        f"QuotaLam {float(model.planner_quota.lambda_value.detach().cpu()):.4f} | "
                         f"ConceptLen {avg_len:.2f} | "
                         f"SeqDiv {seq_div_mean:.4f} | "
                         f"BatchDiv {batch_div_ratio:.4f} | "
@@ -624,9 +589,6 @@ def train():
                         loss_unif=loss_unif,
                         loss_eos=loss_eos,
                         loss_len=loss_len,
-                        loss_quota=loss_quota,
-                        quota_bar=quota_bar,
-                        quota_lambda=model.planner_quota.lambda_value,
                         grad_norm=grad_norm,
                         tau=tau,
                         lr=scheduler.get_last_lr()[0],
@@ -643,12 +605,8 @@ def train():
                         model=model,
                         tokenizer=tokenizer,
                         meta=meta,
-                        mask_cache=mask_cache,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        plan_token_id=plan_token_id,
-                        bos_id=bos_id,
-                        eos_id=eos_id,
                         device=device,
                         global_step=global_step,
                         wandb_run=wandb_run,

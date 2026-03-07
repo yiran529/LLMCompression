@@ -73,38 +73,66 @@ def usage_kl_to_uniform(hist: torch.Tensor) -> torch.Tensor:
     return torch.sum(hist * (torch.log(hist + EPS) - torch.log(u + EPS)))
 
 @dataclass
-class ConceptMeta:
-    type_id: int
-    eos_id: int
-    concept_ids: torch.Tensor
-    concept_ids_with_eos: torch.Tensor
-    max_steps: int
-    target_ratio: float
+class TokenMeta:
+    """统一管理所有特殊token ID，避免混淆"""
+    
+    # ===== Base tokenizer tokens =====
+    bos_id: int                        # 句子开始，如 <s>
+    eos_id: int                        # 句子结束，如 </s>
+    pad_id: int                        # padding token
+    
+    # ===== Planning system tokens =====
+    plan_token_id: int                 # <PLAN> - 触发概念生成
+    concept_eos_id: int                # <EOS_CONCEPT> - 概念序列结束
+    
+    # ===== Concept vocabulary =====
+    concept_ids: torch.Tensor          # [K] - <C_0>, <C_1>, ..., <C_{K-1}>
+    concept_ids_with_eos: torch.Tensor # [K+1] - includes <EOS_CONCEPT>
+    
+    # ===== Type embeddings =====
+    type_id_text: int                  # TYPE_ID_TEXT (0)
+    type_id_concept: int               # TYPE_ID_CONCEPT (1)
+    
+    # ===== Training config =====
+    max_concept_steps: int             # 最大概念序列长度
+    target_concept_ratio: float        # 目标压缩比
+    
+    # ===== Derived properties =====
+    @property
+    def new_rows(self) -> int:
+        """模型需要新增的token embedding行数"""
+        # 注意: 这里的逻辑假设新增的特殊 token 是直接追加在原本 vocab 之后的
+        # <PLAN> (1) + <EOS_CONCEPT> (1) + K个 concept = K + 2
+        return int(self.concept_ids.numel()) + 2
+    
+    @property
+    def planner_vocab_size(self) -> int:
+        """planner输出头大小 (K+1)"""
+        return int(self.concept_ids_with_eos.numel())
+    
+    @property
+    def concept_eos_local_id(self) -> int:
+        """concept EOS在planner词表中的local位置 (应该是最后一个: K)"""
+        return int(self.concept_ids_with_eos.numel() - 1)
+    
+    def concept_local_to_global(self, local_ids: torch.Tensor) -> torch.Tensor:
+        """将planner local ids (0..K) 转换为全局 vocab ids
+        Args:
+            local_ids: [B] or [B, S] 等任意形状的 local concept vocab indices (0..K)
+        Returns:
+            global_ids: 相同形状，全局词表索引
+        """
+        # Assert: local_ids 必须在 [0, K] 范围内
+        assert torch.all(local_ids >= 0) and torch.all(local_ids < self.planner_vocab_size), (
+            f"local_ids out of range: got [{local_ids.min().item()}, {local_ids.max().item()}], "
+            f"expected [0, {self.planner_vocab_size - 1}]"
+        )
+        
+        original_shape = local_ids.shape
+        flat_ids = local_ids.reshape(-1)
+        global_ids = self.concept_ids_with_eos.index_select(0, flat_ids)
+        return global_ids.view(original_shape)
 
-class ConceptMaskCache:
-    def __init__(
-        self,
-        meta: ConceptMeta,
-        vocab_size: int,
-        base_vocab_size: int,
-        blocked_for_executor: List[int],
-        device: str,
-        allow_base_tokens: bool = True,
-    ):
-        """build planner mask and executor output block mask for single concept type."""
-        very_neg = -1e4
-        self.allowed_logits_bias = torch.full((vocab_size,), very_neg, device=device, dtype=torch.float32)
-        if base_vocab_size > 0 and allow_base_tokens:
-            self.allowed_logits_bias[:base_vocab_size] = 0.0
-        self.allowed_logits_bias[meta.concept_ids_with_eos] = 0.0
-
-        # Executor 端输出屏蔽表：True 的位置表示“禁止生成”。
-        # 这里通常屏蔽所有 planner 专用 token（<PLAN>/<EOS_CONCEPT>/<C_*>)，
-        # 避免解码文本时又吐出概念符号。
-        self.executor_block_bool = torch.zeros(vocab_size, device=device, dtype=torch.bool)
-        if blocked_for_executor:
-            ids = torch.tensor(sorted(set(blocked_for_executor)), device=device, dtype=torch.long)
-            self.executor_block_bool[ids] = True
 
 class SharedBackboneUnifiedHead(nn.Module):
     def __init__(
@@ -112,6 +140,7 @@ class SharedBackboneUnifiedHead(nn.Module):
         base_model: AutoModelForCausalLM,
         num_type_embeddings: int,
         frozen_output_head_prefix_rows: int = 0,
+        meta: Optional[TokenMeta] = None,
     ):
         """wrap one shared backbone with one unified output head."""
         super().__init__()
@@ -140,7 +169,9 @@ class SharedBackboneUnifiedHead(nn.Module):
             raise ValueError(
                 f"frozen_output_head_prefix_rows must be <= vocab_size, got {base_vocab_size} > {vocab_size}"
             )
-        new_rows = vocab_size - base_vocab_size
+        
+        new_rows = meta.new_rows
+        planner_rows = meta.planner_vocab_size
 
         # Step 2) Build split token embeddings: frozen base rows + trainable new rows.
         self.token_embed_base = nn.Embedding(base_vocab_size, hidden_size)
@@ -159,7 +190,7 @@ class SharedBackboneUnifiedHead(nn.Module):
 
         # Step 4) Build split output head: frozen base rows + trainable new rows.
         self.output_head_base = nn.Linear(hidden_size, base_vocab_size, bias=False)
-        self.output_head_new = nn.Linear(hidden_size, new_rows, bias=False) if new_rows > 0 else None
+        self.output_head_new = nn.Linear(hidden_size, planner_rows, bias=False)
         self.base_vocab_size = base_vocab_size
         self.vocab_size = vocab_size
         self.type_embed = nn.Embedding(num_type_embeddings, hidden_size)
@@ -168,8 +199,7 @@ class SharedBackboneUnifiedHead(nn.Module):
         # Step 5) Keep output heads in the same dtype as token embeddings for speed.
         head_dtype = token_dtype
         self.output_head_base.to(dtype=head_dtype)
-        if self.output_head_new is not None:
-            self.output_head_new.to(dtype=head_dtype)
+        self.output_head_new.to(dtype=head_dtype)
 
         # Step 6) Initialize head weights from model output embeddings when available,
         # falling back to input embeddings for compatibility.
@@ -178,8 +208,9 @@ class SharedBackboneUnifiedHead(nn.Module):
         else:
             src_weight = src_input_weight
         self.output_head_base.weight.data.copy_(src_weight[:base_vocab_size])
-        if self.output_head_new is not None:
-            self.output_head_new.weight.data.copy_(src_weight[base_vocab_size:])
+        
+        planner_token_ids = meta.concept_ids_with_eos.to(device=src_weight.device, dtype=torch.long)
+        self.output_head_new.weight.data.copy_(src_weight.index_select(0, planner_token_ids))
 
         nn.init.zeros_(self.type_embed.weight)
         # Freeze base output head rows.
@@ -211,13 +242,13 @@ class SharedBackboneUnifiedHead(nn.Module):
             return self.token_embed_base.weight.new_empty((0, self.hidden_size))
         return self.token_embed_new.weight
 
-    def forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """compute logits for full vocab with split output head."""
-        logits_base = self.output_head_base(hidden)
-        if self.output_head_new is None:
-            return logits_base
-        logits_new = self.output_head_new(hidden)
-        return torch.cat([logits_base, logits_new], dim=-1)
+    def executor_forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """compute executor logits with base head only."""
+        return self.output_head_base(hidden)
+
+    def planner_forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """compute planner logits on planner-only vocabulary (K+1)."""
+        return self.output_head_new(hidden)
 
     def embed_with_type(self, token_ids: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
         """compose token embeddings with additive type embeddings."""
@@ -252,42 +283,6 @@ class PlannerTypeOutput:
 @dataclass
 class PlannerOutput:
     concept: PlannerTypeOutput
-    quota_mass_sum: torch.Tensor
-    quota_count: torch.Tensor
-
-class PlannerQuotaController:
-    def __init__(self, *, tau: float, eta: float, lambda_init: float, lambda_max: float, device: str):
-        self.tau = float(tau)
-        self.eta = float(eta)
-        self.lambda_max = float(lambda_max)
-        self.lambda_value = torch.tensor(lambda_init, device=device, dtype=torch.float32)
-
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        return {"lambda_value": self.lambda_value.detach().cpu()}
-
-    def load_state_dict(self, state: Dict[str, torch.Tensor], device: str) -> None:
-        if "lambda_value" in state:
-            self.lambda_value = state["lambda_value"].to(device=device, dtype=torch.float32)
-
-    def compute_loss(self, quota_mass_sum: torch.Tensor, quota_count: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if quota_count.item() < 0.5:
-            zero = torch.zeros((), device=quota_mass_sum.device, dtype=torch.float32)
-            return zero, zero
-        bar_m = quota_mass_sum / quota_count
-        loss_quota = self.lambda_value.detach() * F.relu(bar_m - self.tau)
-        with torch.no_grad():
-            new_lambda = self.lambda_value + self.eta * (bar_m.detach() - self.tau)
-            self.lambda_value = torch.clamp(new_lambda, min=0.0, max=self.lambda_max)
-        return loss_quota, bar_m
-
-def compute_planner_quota_loss(
-    planner_out: PlannerOutput,
-    quota_controller: PlannerQuotaController,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if quota_controller is None:
-        zero = torch.zeros((), device=planner_out.quota_mass_sum.device, dtype=torch.float32)
-        return zero, zero
-    return quota_controller.compute_loss(planner_out.quota_mass_sum, planner_out.quota_count)
 
 def build_concept_special_tokens(cfg: ConceptConfig) -> List[str]:
     """define planner-side special tokens for single concept vocabulary."""
@@ -297,26 +292,64 @@ def build_concept_special_tokens(cfg: ConceptConfig) -> List[str]:
         special_tokens.append(f"<C_{k}>")
     return special_tokens
 
-def build_concept_meta(
+def build_token_meta(
     tokenizer: AutoTokenizer,
     cfg: ConceptConfig,
     device: str,
-) -> ConceptMeta:
-    """resolve concept token IDs and pack them into runtime metadata."""
-    eos_id = tokenizer.convert_tokens_to_ids("<EOS_CONCEPT>")
+) -> TokenMeta:
+    """统一构建所有token ID元数据"""
+    vocab_size = len(tokenizer)
+    
+    # 获取所有特殊 token IDs
+    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
+    concept_eos_id = tokenizer.convert_tokens_to_ids("<EOS_CONCEPT>")
+    
+    # Assert: 所有基础 token IDs 必须有效
+    assert bos_id is not None and 0 <= bos_id < vocab_size, f"Invalid bos_id: {bos_id}"
+    assert eos_id is not None and 0 <= eos_id < vocab_size, f"Invalid eos_id: {eos_id}"
+    assert pad_id is not None and 0 <= pad_id < vocab_size, f"Invalid pad_id: {pad_id}"
+    assert plan_token_id is not None and 0 <= plan_token_id < vocab_size, (
+        f"Invalid plan_token_id: {plan_token_id}. Ensure <PLAN> token is added to tokenizer."
+    )
+    assert concept_eos_id is not None and 0 <= concept_eos_id < vocab_size, (
+        f"Invalid concept_eos_id: {concept_eos_id}. Ensure <EOS_CONCEPT> token is added to tokenizer."
+    )
+    
+    # 获取 concept tokens
     concept_tokens = [f"<C_{k}>" for k in range(cfg.size)]
     concept_ids = tokenizer.convert_tokens_to_ids(concept_tokens)
+    
+    # Assert: 所有 concept IDs 必须有效
+    assert all(cid is not None and 0 <= cid < vocab_size for cid in concept_ids), (
+        f"Invalid concept_ids: {concept_ids}. Ensure all <C_k> tokens are added to tokenizer."
+    )
+    
     concept_ids_t = torch.tensor(concept_ids, device=device, dtype=torch.long)
     concept_ids_eos = torch.cat(
-        [concept_ids_t, torch.tensor([eos_id], device=device, dtype=torch.long)], dim=0
+        [concept_ids_t, torch.tensor([concept_eos_id], device=device, dtype=torch.long)], dim=0
     )
-    return ConceptMeta(
-        type_id=TYPE_ID_CONCEPT,
-        eos_id=eos_id,
+    
+    # Assert: concept_eos_id 必须在最后位置
+    assert int(concept_ids_eos[-1].item()) == concept_eos_id, (
+        f"Internal error: concept_ids_with_eos must end with concept_eos_id. "
+        f"Got {concept_ids_eos[-1].item()}, expected {concept_eos_id}."
+    )
+    
+    return TokenMeta(
+        bos_id=int(bos_id),
+        eos_id=int(eos_id),
+        pad_id=int(pad_id),
+        plan_token_id=int(plan_token_id),
+        concept_eos_id=int(concept_eos_id),
         concept_ids=concept_ids_t,
         concept_ids_with_eos=concept_ids_eos,
-        max_steps=cfg.max_steps,
-        target_ratio=cfg.target_ratio,
+        type_id_text=TYPE_ID_TEXT,
+        type_id_concept=TYPE_ID_CONCEPT,
+        max_concept_steps=cfg.max_steps,
+        target_concept_ratio=cfg.target_ratio,
     )
 
 def plan_concepts(
@@ -324,13 +357,9 @@ def plan_concepts(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    plan_token_id: int,
-    bos_id: int,
-    meta: ConceptMeta,
-    mask_cache: ConceptMaskCache,
+    meta: TokenMeta,
     tau: float,
     min_concept_steps: int,
-    base_vocab_size: int,
     device: str,
     sampling_mode: str = "gumbel",
     mix_greedy_ratio: float = 0.0,
@@ -340,6 +369,10 @@ def plan_concepts(
     bsz, _ = input_ids.shape
     hidden_size = model.hidden_size
     dtype_embed = model.token_embed_base.weight.dtype
+
+    # 从 meta 获取所需的 token IDs
+    bos_id = meta.bos_id
+    plan_token_id = meta.plan_token_id
 
     bos_col = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
     plan_col = torch.full((bsz, 1), plan_token_id, device=device, dtype=torch.long)
@@ -363,13 +396,21 @@ def plan_concepts(
         position_ids=planner_pos,
         use_cache=use_cache,
     )
-    logits_t = model.forward_head(out.last_hidden_state[:, -1, :])  # [B, V]
+    
+    # 从 meta 获取 planner 词表相关信息
+    eos_id = int(meta.concept_eos_id)
+    eos_local_id = meta.concept_eos_local_id
+
+    logits_t = model.planner_forward_head(out.last_hidden_state[:, -1, :])  # [B, K+1]
+    if logits_t.size(1) != meta.planner_vocab_size:
+        raise RuntimeError(
+            f"Planner head output dim mismatch: got {logits_t.size(1)}, expected {meta.planner_vocab_size}"
+        )
     past_kv = out.past_key_values
 
     ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
-    eos_id = int(meta.eos_id)
     src_lengths = attention_mask.sum(dim=1).to(torch.long)
-    expected = (src_lengths.float() * meta.target_ratio).long().clamp(min=1, max=meta.max_steps)
+    expected = (src_lengths.float() * meta.target_concept_ratio).long().clamp(min=1, max=meta.max_concept_steps)
 
     commit_sum1 = torch.zeros((), device=device, dtype=torch.float32)
     commit_sum2 = torch.zeros((), device=device, dtype=torch.float32)
@@ -378,42 +419,49 @@ def plan_concepts(
     eos_count = torch.zeros((), device=device, dtype=torch.float32)
 
     concept_table = model.embed_tokens(meta.concept_ids_with_eos)  # [K+1, H]
-    type_vec = model.type_embed.weight[int(meta.type_id)].view(1, -1).to(dtype=dtype_embed)
+    type_vec = model.type_embed.weight[int(meta.type_id_concept)].view(1, -1).to(dtype=dtype_embed)
 
-    concept_tokens = torch.full((bsz, meta.max_steps), eos_id, device=device, dtype=torch.long)
-    concept_valid = torch.zeros((bsz, meta.max_steps), device=device, dtype=torch.long)
-    concept_st_embeds = torch.zeros((bsz, meta.max_steps, hidden_size), device=device, dtype=dtype_embed)
+    concept_tokens = torch.full((bsz, meta.max_concept_steps), eos_id, device=device, dtype=torch.long)
+    concept_valid = torch.zeros((bsz, meta.max_concept_steps), device=device, dtype=torch.long)
+    concept_st_embeds = torch.zeros((bsz, meta.max_concept_steps, hidden_size), device=device, dtype=dtype_embed)
     finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
-
-    quota_mass_sum = torch.zeros((), device=device, dtype=torch.float32)
-    quota_count = torch.zeros((), device=device, dtype=torch.float32)
 
     cache_attention_mask = planner_mask
     cache_position_ids = planner_pos[:, -1:].clone() + 1
 
-    for step in range(meta.max_steps):
+    for step in range(meta.max_concept_steps):
         active = ~finished
         if not torch.any(active):
             break
 
-        masked_logits = logits_t.float().clone() + mask_cache.allowed_logits_bias.view(1, -1)
+        masked_logits = logits_t.float().clone()
         if torch.any(~active):
             masked_logits[~active] = -1e4
-            masked_logits[~active, eos_id] = 0.0
+            masked_logits[~active, eos_local_id] = 0.0
 
         if min_concept_steps > 1 and step < (min_concept_steps - 1):
-            masked_logits[active, eos_id] = -1e4
-        if step >= (meta.max_steps - 1):
+            masked_logits[active, eos_local_id] = -1e4
+        if step >= (meta.max_concept_steps - 1):
             forced = torch.full_like(masked_logits[active], -1e4)
-            forced[:, eos_id] = 0.0
+            forced[:, eos_local_id] = 0.0
             masked_logits[active] = forced
 
-        probs, sampled_ids = _select_planner_tokens(
+        probs, sampled_ids_local = _select_planner_tokens(
             masked_logits=masked_logits,
             tau=tau,
             sampling_mode=sampling_mode,
             mix_greedy_ratio=mix_greedy_ratio,
         )
+
+        # Assert: sampled_ids_local 必须在 [0, K] 范围内
+        assert torch.all(sampled_ids_local >= 0) and torch.all(sampled_ids_local < meta.planner_vocab_size), (
+            f"sampled_ids_local out of range at step {step}: "
+            f"got [{sampled_ids_local.min().item()}, {sampled_ids_local.max().item()}], "
+            f"expected [0, {meta.planner_vocab_size - 1}]"
+        )
+
+        # 将 local ids (0..K) 转换为 global vocab ids
+        sampled_ids = meta.concept_local_to_global(sampled_ids_local)
 
         sampled_ids = torch.where(
             active,
@@ -424,19 +472,8 @@ def plan_concepts(
         concept_tokens[active, step] = sampled_ids[active]
         concept_valid[active, step] = 1
 
-        if base_vocab_size > 0:
-            rows_logits = masked_logits[active]
-            logz = torch.logsumexp(rows_logits, dim=-1)
-            logz_base = torch.logsumexp(rows_logits[:, :base_vocab_size], dim=-1)
-            base_mass = torch.exp(logz_base - logz)
-            active_ids = sampled_ids[active]
-            count_mask = active_ids.ne(eos_id)
-            if torch.any(count_mask):
-                quota_mass_sum = quota_mass_sum + base_mass[count_mask].sum()
-                quota_count = quota_count + count_mask.sum().to(quota_count.dtype)
-
         active_rows = active.nonzero(as_tuple=False).squeeze(1)
-        probs_subset = probs[active_rows].index_select(1, meta.concept_ids_with_eos)  # [N, K+1]
+        probs_subset = probs[active_rows]  # [N, K+1]
         hist_sum = hist_sum + probs_subset[:, :-1].sum(dim=0)
 
         soft_t = torch.matmul(probs_subset.to(concept_table.dtype), concept_table).to(dtype=dtype_embed) + type_vec
@@ -449,7 +486,7 @@ def plan_concepts(
         commit_sum2 = commit_sum2 + (soft_f - hard_f.detach()).pow(2).sum()
 
         eos_target = (step >= (expected[active_rows] - 1)).float()
-        eos_logit = masked_logits[active_rows, eos_id]
+        eos_logit = masked_logits[active_rows, eos_local_id]
         eos_sum = eos_sum + F.binary_cross_entropy_with_logits(
             eos_logit.float(), eos_target, reduction="sum"
         )
@@ -486,7 +523,7 @@ def plan_concepts(
             past_key_values=past_kv,
             use_cache=use_cache,
         )
-        logits_t = model.forward_head(out_next.last_hidden_state[:, -1, :])  # [B, V]
+        logits_t = model.planner_forward_head(out_next.last_hidden_state[:, -1, :])  # [B, K+1]
         past_kv = out_next.past_key_values
 
     actual_lengths = concept_valid.sum(dim=1)
@@ -497,7 +534,7 @@ def plan_concepts(
         st_embeds=concept_st_embeds,
     )
 
-    denom = max(1.0, float(bsz * meta.max_steps * hidden_size))
+    denom = max(1.0, float(bsz * meta.max_concept_steps * hidden_size))
     loss_commit = commit_sum1 / denom + BETA_COMMIT * (commit_sum2 / denom)
 
     hist_total = hist_sum.sum()
@@ -513,8 +550,6 @@ def plan_concepts(
     return (
         PlannerOutput(
             concept=concept_out,
-            quota_mass_sum=quota_mass_sum,
-            quota_count=quota_count,
         ),
         loss_commit,
         loss_unif,
@@ -526,8 +561,7 @@ def build_executor_prefix(
     model: SharedBackboneUnifiedHead,
     *,
     planner_out: PlannerOutput,
-    meta: ConceptMeta,
-    bos_id: int,
+    meta: TokenMeta,
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """build concept-only executor prefix with type ids, mask, reset positions, and embeddings."""
@@ -542,6 +576,7 @@ def build_executor_prefix(
 
     # Block 0: BOS-only prefix.
     # Executor starts from BOS and does not see source text tokens.
+    bos_id = meta.bos_id
     bos = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
     bos_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
     token_chunks.append(bos)
@@ -556,7 +591,7 @@ def build_executor_prefix(
     assert max_len > 0, "Planner did not generate any valid concept tokens, cannot build executor prefix."
     tok = type_out.token_ids[:, :max_len]
     msk = type_out.valid_mask[:, :max_len]
-    typ = torch.full_like(tok, meta.type_id)
+    typ = torch.full_like(tok, meta.type_id_concept)
     token_chunks.append(tok)
     type_chunks.append(typ)
     mask_chunks.append(msk)
@@ -607,17 +642,15 @@ def build_decoder_tensors(
 
     return decoder_in, decoder_mask, labels, lengths
 
-
-# Backward-compatible alias for older imports.
-SharedBackboneTwoHeads = SharedBackboneUnifiedHead
-
 def build_executor_blocklist(
-    meta: ConceptMeta,
-    plan_token_id: int,
+    meta: TokenMeta,
 ) -> List[int]:
-    """return token IDs that executor logits must never generate."""
-    blocked: List[int] = [plan_token_id]
-    blocked.append(meta.eos_id)
+    """return token IDs that executor logits must never generate.
+    
+    Note: This function is kept for backward compatibility.
+    """
+    blocked: List[int] = [meta.plan_token_id]
+    blocked.append(meta.concept_eos_id)
     blocked.extend(meta.concept_ids.tolist())
     return blocked
 
@@ -645,11 +678,7 @@ def run_executor_inference(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    plan_token_id: int,
-    bos_id: int,
-    eos_id: int,
-    meta: ConceptMeta,
-    mask_cache: ConceptMaskCache,
+    meta: TokenMeta,
     device: str,
     max_new_tokens: int = 64,
     planner_tau: float = 0.2,
@@ -659,6 +688,10 @@ def run_executor_inference(
     bsz = input_ids.size(0)
     max_new_tokens = max(0, int(max_new_tokens))
 
+    # 从 meta 获取 token IDs
+    bos_id = meta.bos_id
+    eos_id = meta.eos_id
+
     was_training = model.training
     model.eval()
     try:
@@ -666,14 +699,10 @@ def run_executor_inference(
             model,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            plan_token_id=plan_token_id,
-            bos_id=bos_id,
             meta=meta,
-            mask_cache=mask_cache,
             tau=planner_tau,
             sampling_mode="greedy",
             min_concept_steps=min_concept_steps,
-            base_vocab_size=model.base_vocab_size,
             device=device,
         )
         (
@@ -686,7 +715,6 @@ def run_executor_inference(
             model,
             planner_out=planner_out,
             meta=meta,
-            bos_id=bos_id,
             device=device,
         )
 
@@ -713,8 +741,7 @@ def run_executor_inference(
             position_ids=prime_pos,
             use_cache=True,
         )
-        logits_t = model.forward_head(out.last_hidden_state[:, -1, :]).float()  # [B, V]
-        logits_t = logits_t.masked_fill(mask_cache.executor_block_bool.view(1, -1), -1e4)
+        logits_t = model.executor_forward_head(out.last_hidden_state[:, -1, :]).float()  # [B, V_base]
         past_kv = out.past_key_values
 
         ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
@@ -751,8 +778,7 @@ def run_executor_inference(
                 past_key_values=past_kv,
                 use_cache=True,
             )
-            logits_t = model.forward_head(out.last_hidden_state[:, -1, :]).float()
-            logits_t = logits_t.masked_fill(mask_cache.executor_block_bool.view(1, -1), -1e4)
+            logits_t = model.executor_forward_head(out.last_hidden_state[:, -1, :]).float()
             past_kv = out.past_key_values
             fed_len += 1
 

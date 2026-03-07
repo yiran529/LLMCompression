@@ -34,11 +34,7 @@ def run_inference() -> None:
             runtime.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            plan_token_id=runtime.plan_token_id,
-            bos_id=runtime.bos_id,
-            eos_id=runtime.eos_id,
             meta=runtime.meta,
-            mask_cache=runtime.mask_cache,
             device=runtime.device,
             max_new_tokens=INFER_MAX_NEW_TOKENS,
             planner_tau=INFER_PLANNER_TAU,
@@ -50,7 +46,7 @@ def run_inference() -> None:
             global_idx = sample_offset + i
             gen_len = int(infer_out.lengths[i].item())
             gen_ids = infer_out.generated_ids[i, :gen_len].tolist()
-            gen_ids = trim_to_first_eos(gen_ids, runtime.eos_id)
+            gen_ids = trim_to_first_eos(gen_ids, runtime.meta.eos_id)
             out_text = tokenizer.decode(gen_ids, skip_special_tokens=INFER_SKIP_SPECIAL_TOKENS)
 
             print("=" * 100)

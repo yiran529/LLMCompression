@@ -574,3 +574,29 @@ Captain America is a S.H.I.E.L.D. agent on Earth-65, who apprehends Spider-Gwen 
 Early history
 The earliest known reference to the city of Alexandria is found in the 1st century BC, in the writings of the Egyptian historian P
 
+
+
+# so far 问题总结
+你现在在做一个 **Planner→Executor 两阶段、共享骨干+新增 concept token 的压缩/受控生成框架**，但训练和评估遇到以下核心问题与现象：
+* **核心症状：概念序列与重建失效**
+  * eval（greedy 解码）时，Planner 生成的 concept 序列曾出现明显 **collapse**：不同输入产生非常相似的 concept，且出现连续重复 token（自环式重复、固定尾巴模板）。
+  * Executor 的输出与输入语义 **严重脱钩**，经常生成百科式高频模板段落（如 “1990s…”、“History…”），几乎不能还原原意。
+  * 即使 concept 序列后来不再严重重复，**重建仍明显跑题**。
+* **训练/评估错位（train 多样、eval 单一）**
+  * 训练阶段 Planner 使用 **Gumbel 采样**（带随机性），concept 在训练日志里看起来较多样；
+  * 评估阶段使用 **greedy**，concept 序列明显更单一/更模板化，说明存在显著的 **train–eval mismatch**。
+* **对重复的改善但对语义仍无效**
+  * 通过 **gumbel+greedy 混合训练**、降低 τ_min 后：
+    * concept 序列的连续重复大幅减少，单条序列内重复也明显缓解；
+    * 但 **重建仍很差**，输出依旧与输入无关；
+    * 训练中 concept 的 diversity 仍逐渐下降（unique 率约 0.75）。
+* **损失项与训练动态的观测**
+  * `loss_rec` 在改进后能降到约 **3**（之前 corruption 方案下曾卡到 ~4），但语义对齐仍差；
+  * `loss_unif` 降到 0.25 以下、`loss_eos` 很低（~0.03），`loss_commit` 缓慢上升但量级很小（~8e-6）。
+* **Corruption/噪声策略可能导致条件信息被破坏**
+  * 在某轮实验中，对 TF 输入的部分位置不是替换 token，而是对 **embedding 注入高斯噪声**（按 embedding std 缩放）。
+  * 这可能让 Executor 更倾向于输出高频模板（条件信号不可靠），从而出现“loss 下降但语义不对”的现象。
+* **Sanity check：单样本可拟合但出现“阈值式跳变”**
+  * 用单个样本训练时模型确实能最终完美拟合；
+  * 但在某个 step 之前 eval 输出完全跑题，到了某个 step 后突然开始完美重建，显示出 **评估路径/解码吸引子或训练–推理不一致**导致的“突然换轨”。
+一句话概括：**Planner 的概念序列曾发生贪心解码下的退化/模板化，虽然通过混合采样等手段缓解了重复，但 Executor 仍未建立“concept/输入 → 输出”的强条件依赖，导致重建长期语义脱钩；同时 TF 噪声/训练-评估错位可能进一步加剧这种失效。**
