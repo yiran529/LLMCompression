@@ -60,6 +60,19 @@ def _select_planner_tokens(
     raise ValueError(f"Unsupported sampling_mode: {sampling_mode}. Use 'gumbel', 'greedy', or 'mix'.")
 
 
+def _detach_past_key_values(past_key_values):
+    """Detach KV cache tensors so later planner steps cannot backprop into earlier steps."""
+    if isinstance(past_key_values, tuple):
+        detached_layers = []
+        for layer in past_key_values:
+            if isinstance(layer, tuple):
+                detached_layers.append(tuple(x.detach() if torch.is_tensor(x) else x for x in layer))
+            else:
+                detached_layers.append(layer.detach() if torch.is_tensor(layer) else layer)
+        return tuple(detached_layers)
+    return past_key_values
+
+
 def commitment_loss(e_soft: torch.Tensor, e_hard: torch.Tensor, beta: float) -> torch.Tensor:
     """compute VQ-style commitment loss between soft and hard embeddings."""
     loss1 = (e_soft.detach() - e_hard).pow(2).mean()
@@ -608,14 +621,15 @@ def plan_concepts(
         cache_position_ids = cache_position_ids + 1
 
         out_next = model.forward_backbone(
-            inputs_embeds=st_embed.unsqueeze(1),  # [B, 1, H]
+            # Stop cross-step gradient: step t+1 cannot update step t concept embeddings.
+            inputs_embeds=st_embed.detach().unsqueeze(1),  # [B, 1, H]
             attention_mask=cache_attention_mask,  # [B, T_curr]
             position_ids=cache_position_ids,      # [B, 1]
-            past_key_values=past_kv,
+            past_key_values=_detach_past_key_values(past_kv),
             use_cache=use_cache,
         )
         logits_t = model.planner_forward_head(out_next.last_hidden_state[:, -1, :])  # [B, K+1]
-        past_kv = out_next.past_key_values
+        past_kv = _detach_past_key_values(out_next.past_key_values)
 
     # =========================================================================
     # 7. 汇总输出结果并合并计算全局 Loss
