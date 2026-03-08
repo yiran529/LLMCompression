@@ -132,8 +132,10 @@ def _kmeans_initialize_new_token_rows(
 
         # Keep control tokens anchored to known semantic rows.
         input_embed.weight[meta.plan_token_id].copy_(input_embed.weight[meta.bos_id])
+        input_embed.weight[meta.exec_token_id].copy_(input_embed.weight[meta.bos_id])
         input_embed.weight[meta.concept_eos_id].copy_(input_embed.weight[meta.eos_id])
         output_embed.weight[meta.plan_token_id].copy_(output_embed.weight[meta.bos_id])
+        output_embed.weight[meta.exec_token_id].copy_(output_embed.weight[meta.bos_id])
         output_embed.weight[meta.concept_eos_id].copy_(output_embed.weight[meta.eos_id])
 
 @dataclass
@@ -147,6 +149,7 @@ class TokenMeta:
     
     # ===== Planning system tokens =====
     plan_token_id: int                 # <PLAN> - 触发概念生成
+    exec_token_id: int                 # <EXEC> - executor 前缀起始
     concept_eos_id: int                # <EOS_CONCEPT> - 概念序列结束
     
     # ===== Concept vocabulary =====
@@ -166,8 +169,8 @@ class TokenMeta:
     def new_rows(self) -> int:
         """模型需要新增的token embedding行数"""
         # 注意: 这里的逻辑假设新增的特殊 token 是直接追加在原本 vocab 之后的
-        # <PLAN> (1) + <EOS_CONCEPT> (1) + K个 concept = K + 2
-        return int(self.concept_ids.numel()) + 2
+        # <PLAN> (1) + <EXEC> (1) + <EOS_CONCEPT> (1) + K个 concept = K + 3
+        return int(self.concept_ids.numel()) + 3
     
     @property
     def planner_vocab_size(self) -> int:
@@ -342,7 +345,7 @@ class PlannerOutput:
 
 def build_concept_special_tokens(cfg: ConceptConfig) -> List[str]:
     """define planner-side special tokens for single concept vocabulary."""
-    special_tokens: List[str] = ["<PLAN>"]
+    special_tokens: List[str] = ["<PLAN>", "<EXEC>"]
     special_tokens.append("<EOS_CONCEPT>")
     for k in range(cfg.size):
         special_tokens.append(f"<C_{k}>")
@@ -361,6 +364,7 @@ def build_token_meta(
     eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
+    exec_token_id = tokenizer.convert_tokens_to_ids("<EXEC>")
     concept_eos_id = tokenizer.convert_tokens_to_ids("<EOS_CONCEPT>")
     
     # Assert: 所有基础 token IDs 必须有效
@@ -369,6 +373,9 @@ def build_token_meta(
     assert pad_id is not None and 0 <= pad_id < vocab_size, f"Invalid pad_id: {pad_id}"
     assert plan_token_id is not None and 0 <= plan_token_id < vocab_size, (
         f"Invalid plan_token_id: {plan_token_id}. Ensure <PLAN> token is added to tokenizer."
+    )
+    assert exec_token_id is not None and 0 <= exec_token_id < vocab_size, (
+        f"Invalid exec_token_id: {exec_token_id}. Ensure <EXEC> token is added to tokenizer."
     )
     assert concept_eos_id is not None and 0 <= concept_eos_id < vocab_size, (
         f"Invalid concept_eos_id: {concept_eos_id}. Ensure <EOS_CONCEPT> token is added to tokenizer."
@@ -399,6 +406,7 @@ def build_token_meta(
         eos_id=int(eos_id),
         pad_id=int(pad_id),
         plan_token_id=int(plan_token_id),
+        exec_token_id=int(exec_token_id),
         concept_eos_id=int(concept_eos_id),
         concept_ids=concept_ids_t,
         concept_ids_with_eos=concept_ids_eos,
@@ -434,16 +442,18 @@ def plan_concepts(
     plan_token_id = meta.plan_token_id
 
     # =========================================================================
-    # 2. 构造 Planner 的输入序列：[BOS] + Source Text + [PLAN]
+    # 2. 构造 Planner 的输入序列：[BOS] + Source Text + [EOS] + [PLAN]
     # =========================================================================
     bos_col = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
+    eos_col = torch.full((bsz, 1), meta.eos_id, device=device, dtype=torch.long)
     plan_col = torch.full((bsz, 1), plan_token_id, device=device, dtype=torch.long)
-    planner_input_ids = torch.cat([bos_col, input_ids, plan_col], dim=1)
+    planner_input_ids = torch.cat([bos_col, input_ids, eos_col, plan_col], dim=1)
     planner_type_ids = torch.full_like(planner_input_ids, TYPE_ID_TEXT)
     planner_mask = torch.cat(
         [
             torch.ones((bsz, 1), device=device, dtype=torch.long),
             attention_mask,
+            torch.ones((bsz, 1), device=device, dtype=torch.long),
             torch.ones((bsz, 1), device=device, dtype=torch.long),
         ],
         dim=1,
@@ -658,15 +668,14 @@ def build_executor_prefix(
     mask_chunks: List[torch.Tensor] = []
     embed_chunks: List[torch.Tensor] = []
 
-    # Block 0: BOS-only prefix.
-    # Executor starts from BOS and does not see source text tokens.
-    bos_id = meta.bos_id
-    bos = torch.full((bsz, 1), bos_id, device=device, dtype=torch.long)
-    bos_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
-    token_chunks.append(bos)
-    type_chunks.append(bos_type)
+    # Block 0: EXEC control token.
+    # Executor starts from <EXEC>, then consumes concept prefix and later text BOS.
+    exec_tok = torch.full((bsz, 1), meta.exec_token_id, device=device, dtype=torch.long)
+    exec_type = torch.full((bsz, 1), TYPE_ID_TEXT, device=device, dtype=torch.long)
+    token_chunks.append(exec_tok)
+    type_chunks.append(exec_type)
     mask_chunks.append(torch.ones((bsz, 1), device=device, dtype=torch.long))
-    embed_chunks.append(model.embed_with_type(bos, bos_type))
+    embed_chunks.append(model.embed_with_type(exec_tok, exec_type))
 
     type_out = planner_out.concept
     type_lens = type_out.valid_mask.sum(dim=1).to(torch.long)
@@ -734,6 +743,7 @@ def build_executor_blocklist(
     Note: This function is kept for backward compatibility.
     """
     blocked: List[int] = [meta.plan_token_id]
+    blocked.append(meta.exec_token_id)
     blocked.append(meta.concept_eos_id)
     blocked.extend(meta.concept_ids.tolist())
     return blocked

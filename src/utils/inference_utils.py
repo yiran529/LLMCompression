@@ -103,6 +103,7 @@ def _build_meta_from_state(head_state: dict, tokenizer: AutoTokenizer, device: s
     eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
+    exec_token_id = tokenizer.convert_tokens_to_ids("<EXEC>")
     
     # Assert: tokenizer 中的基础 token IDs 必须有效
     assert bos_id is not None and 0 <= bos_id < vocab_size, f"Invalid bos_id: {bos_id}"
@@ -111,12 +112,16 @@ def _build_meta_from_state(head_state: dict, tokenizer: AutoTokenizer, device: s
     assert plan_token_id is not None and 0 <= plan_token_id < vocab_size, (
         f"Invalid plan_token_id: {plan_token_id}. Ensure <PLAN> is in tokenizer."
     )
+    assert exec_token_id is not None and 0 <= exec_token_id < vocab_size, (
+        f"Invalid exec_token_id: {exec_token_id}. Ensure <EXEC> is in tokenizer."
+    )
     
     return TokenMeta(
         bos_id=int(bos_id),
         eos_id=int(eos_id),
         pad_id=int(pad_id),
         plan_token_id=int(plan_token_id),
+        exec_token_id=int(exec_token_id),
         concept_eos_id=concept_eos_id,
         concept_ids=concept_ids,
         concept_ids_with_eos=concept_ids_with_eos,
