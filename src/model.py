@@ -161,32 +161,24 @@ class SharedBackboneUnifiedHead(nn.Module):
 
         out_embed = base_model.get_output_embeddings()
         # Step 1) Resolve how many vocab rows are "base" (frozen) vs "new" (trainable).
-        if frozen_output_head_prefix_rows <= 0:
-            base_vocab_size = vocab_size
-        else:
-            base_vocab_size = frozen_output_head_prefix_rows
-        if base_vocab_size > vocab_size:
-            raise ValueError(
-                f"frozen_output_head_prefix_rows must be <= vocab_size, got {base_vocab_size} > {vocab_size}"
-            )
+        assert frozen_output_head_prefix_rows >= 0, "frozen_output_head_prefix_rows must be non-negative"
+        assert frozen_output_head_prefix_rows <= vocab_size, "frozen_output_head_prefix_rows cannot exceed vocab size"
+        base_vocab_size = frozen_output_head_prefix_rows
         
         new_rows = meta.new_rows
         planner_rows = meta.planner_vocab_size
 
         # Step 2) Build split token embeddings: frozen base rows + trainable new rows.
-        self.token_embed_base = nn.Embedding(base_vocab_size, hidden_size)
-        self.token_embed_new = nn.Embedding(new_rows, hidden_size) if new_rows > 0 else None
         token_dtype = input_embed.weight.dtype
-        self.token_embed_base.to(dtype=token_dtype)
-        if self.token_embed_new is not None:
-            self.token_embed_new.to(dtype=token_dtype)
+        self.token_embed_base = nn.Embedding(base_vocab_size, hidden_size).to(dtype=token_dtype)
+        self.token_embed_new = nn.Embedding(new_rows, hidden_size).to(dtype=token_dtype) 
+            
 
         # Step 3) Initialize token embeddings from model input embeddings.
         src_input_weight = input_embed.weight.data
         self.token_embed_base.weight.data.copy_(src_input_weight[:base_vocab_size])
         self.token_embed_base.weight.requires_grad = False
-        if self.token_embed_new is not None:
-            self.token_embed_new.weight.data.copy_(src_input_weight[base_vocab_size:])
+        self.token_embed_new.weight.data.copy_(src_input_weight[base_vocab_size:])
 
         # Step 4) Build split output head: frozen base rows + trainable new rows.
         self.output_head_base = nn.Linear(hidden_size, base_vocab_size, bias=False)
@@ -201,16 +193,12 @@ class SharedBackboneUnifiedHead(nn.Module):
         self.output_head_base.to(dtype=head_dtype)
         self.output_head_new.to(dtype=head_dtype)
 
-        # Step 6) Initialize head weights from model output embeddings when available,
-        # falling back to input embeddings for compatibility.
-        if out_embed is not None and out_embed.weight.shape[0] == vocab_size:
-            src_weight = out_embed.weight.data
-        else:
-            src_weight = src_input_weight
-        self.output_head_base.weight.data.copy_(src_weight[:base_vocab_size])
-        
+        # Step 6) Initialize head weights strictly from model output embeddings.
+        assert out_embed.weight.shape[0] == vocab_size, "output embeddings must exist and match vocab size for proper initialization."
+        src_weight = out_embed.weight.detach()
         planner_token_ids = meta.concept_ids_with_eos.to(device=src_weight.device, dtype=torch.long)
-        self.output_head_new.weight.data.copy_(src_weight.index_select(0, planner_token_ids))
+        self.output_head_base.weight.copy_(src_weight[:base_vocab_size])
+        self.output_head_new.weight.copy_(src_weight.index_select(0, planner_token_ids))
 
         nn.init.zeros_(self.type_embed.weight)
         # Freeze base output head rows.
@@ -219,8 +207,6 @@ class SharedBackboneUnifiedHead(nn.Module):
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """embed token ids with frozen base rows + trainable new rows."""
-        if self.token_embed_new is None:
-            return self.token_embed_base(token_ids)
         flat_ids = token_ids.reshape(-1)
         out = torch.empty(
             (flat_ids.numel(), self.hidden_size),
@@ -238,8 +224,6 @@ class SharedBackboneUnifiedHead(nn.Module):
 
     def get_new_token_embed_weight(self) -> torch.Tensor:
         """return trainable new-token embedding rows (possibly empty)."""
-        if self.token_embed_new is None:
-            return self.token_embed_base.weight.new_empty((0, self.hidden_size))
         return self.token_embed_new.weight
 
     def executor_forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -411,16 +395,14 @@ def plan_concepts(
     eos_local_id = meta.concept_eos_local_id
 
     logits_t = model.planner_forward_head(out.last_hidden_state[:, -1, :])  # [B, K+1]
-    if logits_t.size(1) != meta.planner_vocab_size:
-        raise RuntimeError(
-            f"Planner head output dim mismatch: got {logits_t.size(1)}, expected {meta.planner_vocab_size}"
-        )
+    assert logits_t.size(1) == meta.planner_vocab_size, (
+        f"Planner head output dim mismatch: got {logits_t.size(1)}, expected {meta.planner_vocab_size}"
+    )
     past_kv = out.past_key_values
 
     # =========================================================================
     # 4. 计算目标生成长度与初始化各种 Loss 统计量
     # =========================================================================
-    ones_step = torch.ones((bsz, 1), device=device, dtype=torch.long)
     src_lengths = attention_mask.sum(dim=1).to(torch.long)
     expected = (src_lengths.float() * meta.target_concept_ratio).long().clamp(min=1, max=meta.max_concept_steps)
 
@@ -484,12 +466,7 @@ def plan_concepts(
         )
 
         sampled_ids = meta.concept_local_to_global(sampled_ids_local)
-
-        sampled_ids = torch.where(
-            active,
-            sampled_ids,
-            torch.full_like(sampled_ids, eos_id),
-        )
+        sampled_ids = torch.where(active, sampled_ids, torch.full_like(sampled_ids, eos_id))
 
         concept_tokens[active, step] = sampled_ids[active]
         concept_valid[active, step] = 1

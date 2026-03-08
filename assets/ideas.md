@@ -347,6 +347,56 @@ Goal: Two-stage **Planner–Executor Concept-first Decoding**. Concept tokens ar
 
 这个架构非常适合**文本压缩**、**受控生成**或**长文本建模**（通过高层概念减少序列长度）任务。我已完全理解该架构。
 
+#### C-new
+
+##### 1) 核心结构：共享骨干 + 分工双头
+- 共享一个 `AutoModelForCausalLM` backbone（训练时配 LoRA）。
+- 输入侧是**分裂式 embedding**：
+  - `token_embed_base`：原词表部分，冻结。
+  - `token_embed_new`：新增 token（`<PLAN>`, `<EOS_CONCEPT>`, `<C_k>`），可训练。
+  - 再加 `type_embed`（仅两类：`TEXT=0`, `CONCEPT=1`）。
+- 输出侧是**双头分离**（不是拼接统一 logits）：
+  - `executor_forward_head`：base vocab，用于文本生成。
+  - `planner_forward_head`：`K+1`（`K`个概念 + concept EOS），用于规划阶段。
+
+对应实现：`src/model.py`
+
+---
+
+##### 2) Stage-1 Planner：从文本生成概念序列
+- 输入模板：`[BOS] + input_ids + [PLAN]`。
+- 自回归生成 concept token，词表只在 `<C_0..C_{K-1}> + <EOS_CONCEPT>` 内。
+- 采样支持三种：`gumbel` / `greedy` / `mix`（可按比例混合）。
+- 通过 ST（straight-through）把离散采样变成可回传的 embedding 路径。
+- 规划阶段辅助损失：
+  - `loss_commit`（soft/hard embedding 对齐）
+  - `loss_unif`（usage KL 防塌缩）
+  - `loss_eos`（EOS 时机）
+  - `loss_len`（长度超标惩罚，当前主要用于监控）
+
+---
+
+##### 3) Stage-2 Executor：用概念前缀重建文本
+- 前缀构造：`[BOS] + concept_sequence`（concept 部分 type_id=CONCEPT）。
+- 解码端 teacher forcing：
+  - `decoder_in = [BOS, x1, x2, ...]`
+  - `labels = [x1, x2, ..., EOS]`
+- 执行器实际前向：`[prefix, decoder_in]`，只对文本段计算 CE 重建损失。
+- 总训练损失（当前代码）：
+  - `L = λ_rec*loss_rec + λ_commit*loss_commit + λ_unif*loss_unif + λ_eos*loss_eos`
+  - 注意：`loss_len`有计算和日志，但**未并入最终 loss**。
+
+对应实现：`src/train.py`
+
+---
+
+##### 4) 推理流程
+- 先 Planner（greedy）产出概念序列。
+- 用概念构造 prefix 后，Executor greedy 解码文本。
+- 使用 KV cache 增量解码，并维护递增 `attention_mask`。
+
+
+
 ## v3.1: speed up training
 1. 预测concept tokens时MTP （有点类似于AR结合query）
 2. 预测不同type的concept tokens时并行跑
