@@ -72,6 +72,70 @@ def usage_kl_to_uniform(hist: torch.Tensor) -> torch.Tensor:
     u = torch.full_like(hist, 1.0 / max(1, z))
     return torch.sum(hist * (torch.log(hist + EPS) - torch.log(u + EPS)))
 
+
+def _run_kmeans(weight: torch.Tensor, num_clusters: int, num_iters: int = 20) -> torch.Tensor:
+    """Run lightweight K-means on embedding rows and return centers [K, H]."""
+    n_rows = int(weight.size(0))
+    assert n_rows >= num_clusters > 0, f"Invalid num_clusters={num_clusters} for n_rows={n_rows}."
+
+    data = weight.float()
+    device = data.device
+
+    init_ids = torch.randperm(n_rows, device=device)[:num_clusters]
+    centers = data.index_select(0, init_ids).clone()
+
+    for _ in range(max(1, int(num_iters))):
+        dists = torch.cdist(data, centers, p=2)  # [N, K]
+        labels = torch.argmin(dists, dim=1)      # [N]
+
+        new_centers = torch.zeros_like(centers)
+        counts = torch.bincount(labels, minlength=num_clusters)
+        new_centers.index_add_(0, labels, data)
+
+        non_empty = counts > 0
+        if torch.any(non_empty):
+            new_centers[non_empty] = new_centers[non_empty] / counts[non_empty].unsqueeze(1).to(data.dtype)
+        if torch.any(~non_empty):
+            refill_ids = torch.randperm(n_rows, device=device)[: int((~non_empty).sum().item())]
+            new_centers[~non_empty] = data.index_select(0, refill_ids)
+
+        if torch.allclose(new_centers, centers, atol=1e-5, rtol=1e-4):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    return centers
+
+
+def _kmeans_initialize_new_token_rows(
+    *,
+    input_embed: nn.Module,
+    output_embed: nn.Module,
+    meta: TokenMeta,
+    base_vocab_size: int,
+    num_iters: int = 20,
+) -> None:
+    """Initialize new token rows using K-means centers from old vocabulary rows."""
+    concept_ids = meta.concept_ids.to(dtype=torch.long, device=input_embed.weight.device)
+    k = int(concept_ids.numel())
+
+    with torch.no_grad():
+        src_in_base = input_embed.weight[:base_vocab_size]
+        src_out_base = output_embed.weight[:base_vocab_size]
+
+        in_centers = _run_kmeans(src_in_base, num_clusters=k, num_iters=num_iters).to(dtype=input_embed.weight.dtype)
+        out_centers = _run_kmeans(src_out_base, num_clusters=k, num_iters=num_iters).to(dtype=output_embed.weight.dtype)
+
+        # Concept rows come from K-means cluster centers.
+        input_embed.weight.index_copy_(0, concept_ids, in_centers)
+        output_embed.weight.index_copy_(0, concept_ids.to(output_embed.weight.device), out_centers)
+
+        # Keep control tokens anchored to known semantic rows.
+        input_embed.weight[meta.plan_token_id].copy_(input_embed.weight[meta.bos_id])
+        input_embed.weight[meta.concept_eos_id].copy_(input_embed.weight[meta.eos_id])
+        output_embed.weight[meta.plan_token_id].copy_(output_embed.weight[meta.bos_id])
+        output_embed.weight[meta.concept_eos_id].copy_(output_embed.weight[meta.eos_id])
+
 @dataclass
 class TokenMeta:
     """统一管理所有特殊token ID，避免混淆"""
@@ -158,15 +222,23 @@ class SharedBackboneUnifiedHead(nn.Module):
         vocab_size = input_embed.num_embeddings
         hidden_size = input_embed.embedding_dim
         self.hidden_size = hidden_size
-
         out_embed = base_model.get_output_embeddings()
         # Step 1) Resolve how many vocab rows are "base" (frozen) vs "new" (trainable).
         assert frozen_output_head_prefix_rows >= 0, "frozen_output_head_prefix_rows must be non-negative"
         assert frozen_output_head_prefix_rows <= vocab_size, "frozen_output_head_prefix_rows cannot exceed vocab size"
         base_vocab_size = frozen_output_head_prefix_rows
-        
         new_rows = meta.new_rows
         planner_rows = meta.planner_vocab_size
+        assert vocab_size == base_vocab_size + new_rows, f"Vocab shape mismatch: vocab_size={vocab_size}, base_vocab_size={base_vocab_size}, new_rows={new_rows}."
+
+        # Hard-apply K-means init to base model embedding tables before copying slices.
+        _kmeans_initialize_new_token_rows(
+            input_embed=input_embed,
+            output_embed=out_embed,
+            meta=meta,
+            base_vocab_size=base_vocab_size,
+            num_iters=20,
+        )
 
         # Step 2) Build split token embeddings: frozen base rows + trainable new rows.
         token_dtype = input_embed.weight.dtype
