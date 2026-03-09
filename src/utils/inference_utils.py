@@ -126,6 +126,7 @@ def _build_meta_from_state(head_state: dict, tokenizer: AutoTokenizer, device: s
         type_id_concept=int(item["type_id"]),
         max_concept_steps=int(item["max_steps"]),
         target_concept_ratio=float(item["target_ratio"]),
+        original_vocab_size=int(item.get("original_vocab_size", vocab_size)),
     )
 
 

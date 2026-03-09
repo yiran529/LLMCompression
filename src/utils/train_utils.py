@@ -226,11 +226,12 @@ def save_checkpoint(
     tokenizer.save_pretrained(backbone_dir)
 
     meta_dump = {
-        "type_id": meta.type_id,
-        "eos_id": meta.eos_id,
+        "type_id": meta.type_id_concept,
+        "eos_id": meta.concept_eos_id,
         "concept_ids": meta.concept_ids.tolist(),
-        "max_steps": meta.max_steps,
-        "target_ratio": meta.target_ratio,
+        "max_steps": meta.max_concept_steps,
+        "target_ratio": meta.target_concept_ratio,
+        "original_vocab_size": meta.original_vocab_size,
     }
 
     token_embed_new = model.get_new_token_embed_weight().detach().cpu()

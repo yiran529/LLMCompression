@@ -13,9 +13,9 @@ from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_CONCEPT, TYPE_ID_T
 
 def resolve_qwen3_special_token_ids(tokenizer: AutoTokenizer) -> Tuple[int, int, int]:
     """Resolve BOS/EOS/PAD ids for Qwen3 using explicit token strings."""
-    bos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    bos_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
     eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    pad_id = tokenizer.convert_tokens_to_ids( "<|endoftext|>")
+    pad_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
     assert bos_id is not None and eos_id is not None and pad_id is not None, (
         "Tokenizer is missing required Qwen3 special tokens.")
@@ -136,7 +136,7 @@ def _kmeans_initialize_new_token_rows(
     *,
     input_embed: nn.Module,
     output_embed: nn.Module,
-    meta: TokenMeta,
+    meta: "TokenMeta",
     base_vocab_size: int,
     num_iters: int = 20,
 ) -> None:
@@ -145,8 +145,10 @@ def _kmeans_initialize_new_token_rows(
     k = int(concept_ids.numel())
 
     with torch.no_grad():
-        src_in_base = input_embed.weight[:base_vocab_size]
-        src_out_base = output_embed.weight[:base_vocab_size]
+        # Use only original valid vocab for K-means (exclude padding rows if any)
+        kmeans_vocab_size = min(base_vocab_size, meta.original_vocab_size)
+        src_in_base = input_embed.weight[:kmeans_vocab_size]
+        src_out_base = output_embed.weight[:kmeans_vocab_size]
 
         in_centers = _run_kmeans(src_in_base, num_clusters=k, num_iters=num_iters).to(dtype=input_embed.weight.dtype)
         out_centers = _run_kmeans(src_out_base, num_clusters=k, num_iters=num_iters).to(dtype=output_embed.weight.dtype)
@@ -188,6 +190,9 @@ class TokenMeta:
     # ===== Training config =====
     max_concept_steps: int             # 最大概念序列长度
     target_concept_ratio: float        # 目标压缩比
+    
+    # ===== Vocab sizes =====
+    original_vocab_size: int           # 原始有效词汇大小（用于K-means，不含padding）
     
     # ===== Derived properties =====
     @property
@@ -297,8 +302,8 @@ class SharedBackboneUnifiedHead(nn.Module):
         assert out_embed.weight.shape[0] == vocab_size, "output embeddings must exist and match vocab size for proper initialization."
         src_weight = out_embed.weight.detach()
         planner_token_ids = meta.concept_ids_with_eos.to(device=src_weight.device, dtype=torch.long)
-        self.output_head_base.weight.copy_(src_weight[:base_vocab_size])
-        self.output_head_new.weight.copy_(src_weight.index_select(0, planner_token_ids))
+        self.output_head_base.weight.data.copy_(src_weight[:base_vocab_size])
+        self.output_head_new.weight.data.copy_(src_weight.index_select(0, planner_token_ids))
 
         nn.init.zeros_(self.type_embed.weight)
         # Freeze base output head rows.
@@ -380,9 +385,12 @@ def build_token_meta(
     tokenizer: AutoTokenizer,
     cfg: ConceptConfig,
     device: str,
+    original_vocab_size: int = None,
 ) -> TokenMeta:
     """统一构建所有token ID元数据"""
     vocab_size = len(tokenizer)
+    if original_vocab_size is None:
+        original_vocab_size = vocab_size
     
     # Qwen3 官方 tokenizer_config: bos=null, eos=<|im_end|>, pad=<|endoftext|>.
     bos_id, eos_id, pad_id = resolve_qwen3_special_token_ids(tokenizer)
@@ -437,6 +445,7 @@ def build_token_meta(
         type_id_concept=TYPE_ID_CONCEPT,
         max_concept_steps=cfg.max_steps,
         target_concept_ratio=cfg.target_ratio,
+        original_vocab_size=int(original_vocab_size),
     )
 
 def plan_concepts(

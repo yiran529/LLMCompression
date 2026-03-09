@@ -46,14 +46,11 @@ def train():
         logging.info(f"[INFO] resume enabled from: {resume_ckpt_dir}")
 
     # =========================
-    # 2) Tokenizer + special planning tokens
+    # 2) Tokenizer
     # =========================
     # Extend tokenizer with typed concept tokens used only by stage-1 planning.
     tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True)
-    special_tokens = build_concept_special_tokens(CONCEPT_CONFIG)
-    added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-    logging.info(f"[INFO] added special tokens: {added}")
-
+    
     # =========================
     # 3) Model dtype + backbone loading
     # =========================
@@ -73,9 +70,25 @@ def train():
     model_base = AutoModelForCausalLM.from_pretrained(BASE_DIR, **model_kwargs).to(device)
 
     # =========================
-    # 4) Resize embeddings + apply LoRA (or load LoRA on resume)
+    # 4) Align tokenizer vocab size with model config, then add concept tokens
     # =========================
+    # Get model's original vocab size (from config, may include padding rows)
     base_vocab_size = model_base.get_input_embeddings().num_embeddings
+    # Save original tokenizer size (valid vocab, for K-means initialization)
+    original_tokenizer_vocab_size = len(tokenizer)
+    
+    # If tokenizer size < model config size, add padding tokens to align
+    padding_gap = base_vocab_size - original_tokenizer_vocab_size
+    if padding_gap > 0:
+        padding_tokens = [f"<PAD_{i}>" for i in range(padding_gap)]
+        tokenizer.add_special_tokens({"additional_special_tokens": padding_tokens})
+        logging.info(f"[INFO] added {padding_gap} padding tokens to align with model vocab_size={base_vocab_size}")
+    
+    # Now add concept tokens (they will start from base_vocab_size)
+    special_tokens = build_concept_special_tokens(CONCEPT_CONFIG)
+    added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+    logging.info(f"[INFO] added {added} concept tokens, new tokenizer size: {len(tokenizer)}")
+
     # HF 默认保留旧行、只初始化新增行
     model_base.resize_token_embeddings(len(tokenizer))
     lora_cfg = LoraConfig(
@@ -103,7 +116,7 @@ def train():
     # 5) Build unified model and optional resume head states
     # =========================
     # 构建统一的 TokenMeta，管理所有 token ID
-    meta = build_token_meta(tokenizer, CONCEPT_CONFIG, device=device)
+    meta = build_token_meta(tokenizer, CONCEPT_CONFIG, device=device, original_vocab_size=original_tokenizer_vocab_size)
     num_type_embeddings = 2
     model = SharedBackboneUnifiedHead(
         model_base,
