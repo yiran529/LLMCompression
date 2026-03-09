@@ -11,6 +11,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_CONCEPT, TYPE_ID_TEXT, ConceptConfig
 
 
+# Large enough to suppress a token in softmax without creating extreme numeric ranges.
+NEG_INF_LOGIT = -80.0
+
+
 def resolve_qwen3_special_token_ids(tokenizer: AutoTokenizer) -> Tuple[int, int, int]:
     """Resolve BOS/EOS/PAD ids for Qwen3 using explicit token strings."""
     bos_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -163,7 +167,7 @@ def _kmeans_initialize_new_token_rows(
         input_embed.weight[meta.concept_eos_id].copy_(input_embed.weight[meta.eos_id])
         output_embed.weight[meta.plan_token_id].copy_(output_embed.weight[meta.bos_id])
         output_embed.weight[meta.exec_token_id].copy_(output_embed.weight[meta.bos_id])
-        output_embed.weight[meta.concept_eos_id].copy_(output_embed.weight[meta.eos_id])
+        output_embed.weight[meta.concept_eos_id].copy_(out_centers.mean(dim=0))
 
 @dataclass
 class TokenMeta:
@@ -337,7 +341,8 @@ class SharedBackboneUnifiedHead(nn.Module):
 
     def planner_forward_head(self, hidden: torch.Tensor) -> torch.Tensor:
         """compute planner logits on planner-only vocabulary (K+1)."""
-        return self.output_head_new(hidden)
+        # Keep planner head math in fp32 to reduce fp16 overflow during backward.
+        return F.linear(hidden.float(), self.output_head_new.weight.float(), bias=None)
 
     def embed_with_type(self, token_ids: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
         """compose token embeddings with additive type embeddings."""
@@ -509,6 +514,7 @@ def plan_concepts(
     eos_local_id = meta.concept_eos_local_id
 
     logits_t = model.planner_forward_head(out.last_hidden_state[:, -1, :])  # [B, K+1]
+    logits_t = torch.nan_to_num(logits_t, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
     assert logits_t.size(1) == meta.planner_vocab_size, (
         f"Planner head output dim mismatch: got {logits_t.size(1)}, expected {meta.planner_vocab_size}"
     )
@@ -553,13 +559,13 @@ def plan_concepts(
         # =====================================================================
         masked_logits = logits_t.float().clone()
         if torch.any(~active):
-            masked_logits[~active] = -1e4
+            masked_logits[~active] = NEG_INF_LOGIT
             masked_logits[~active, eos_local_id] = 0.0
 
         if min_concept_steps > 1 and step < (min_concept_steps - 1):
-            masked_logits[active, eos_local_id] = -1e4
+            masked_logits[active, eos_local_id] = NEG_INF_LOGIT
         if step >= (meta.max_concept_steps - 1):
-            forced = torch.full_like(masked_logits[active], -1e4)
+            forced = torch.full_like(masked_logits[active], NEG_INF_LOGIT)
             forced[:, eos_local_id] = 0.0
             masked_logits[active] = forced
 
@@ -602,7 +608,7 @@ def plan_concepts(
         commit_sum2 = commit_sum2 + (soft_f - hard_f.detach()).pow(2).sum()
 
         eos_target = (step >= (expected[active_rows] - 1)).float()
-        eos_logit = masked_logits[active_rows, eos_local_id]
+        eos_logit = masked_logits[active_rows, eos_local_id].clamp(-50.0, 50.0)
         eos_sum = eos_sum + F.binary_cross_entropy_with_logits(
             eos_logit.float(), eos_target, reduction="sum"
         )
@@ -648,6 +654,7 @@ def plan_concepts(
             use_cache=use_cache,
         )
         logits_t = model.planner_forward_head(out_next.last_hidden_state[:, -1, :])  # [B, K+1]
+        logits_t = torch.nan_to_num(logits_t, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
         past_kv = _detach_past_key_values(out_next.past_key_values)
 
     # =========================================================================

@@ -250,7 +250,10 @@ def train():
 
     use_amp = torch.cuda.is_available() and model_dtype in (torch.float16, torch.bfloat16)
     use_scaler = torch.cuda.is_available() and model_dtype == torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler) if torch.cuda.is_available() else None
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=use_scaler, init_scale=512.0,)
+        if torch.cuda.is_available() else None
+    )
     if RESUME_ENABLED:
         if not os.path.isfile(resume_trainer_state_path):
             logging.warning(

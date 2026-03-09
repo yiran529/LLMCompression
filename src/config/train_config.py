@@ -51,7 +51,7 @@ STAGE2_TF_MASKING_MIN_RATIO = 0.0
 
 TAU_INIT = 1.0
 TAU_MIN = 0.2
-MIN_CONCEPT_STEPS = 1
+MIN_CONCEPT_STEPS = 4
 # Planner sampling mode during training: "gumbel" | "greedy" | "mix".
 TRAIN_PLANNER_SAMPLING_MODE = "mix"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
