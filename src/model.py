@@ -10,6 +10,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_CONCEPT, TYPE_ID_TEXT, ConceptConfig
 
+
+def resolve_qwen3_special_token_ids(tokenizer: AutoTokenizer) -> Tuple[int, int, int]:
+    """Resolve BOS/EOS/PAD ids for Qwen3 using explicit token strings."""
+    bos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    pad_id = tokenizer.convert_tokens_to_ids( "<|endoftext|>")
+
+    assert bos_id is not None and eos_id is not None and pad_id is not None, (
+        "Tokenizer is missing required Qwen3 special tokens.")
+
+    return int(bos_id), int(eos_id), int(pad_id)
+
 def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = False) -> torch.Tensor:
     """sample relaxed/straight-through categorical vectors from logits."""
     u = torch.empty_like(logits).uniform_(1e-8, 1 - 1e-8)
@@ -372,10 +384,8 @@ def build_token_meta(
     """统一构建所有token ID元数据"""
     vocab_size = len(tokenizer)
     
-    # 获取所有特殊 token IDs
-    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    # Qwen3 官方 tokenizer_config: bos=null, eos=<|im_end|>, pad=<|endoftext|>.
+    bos_id, eos_id, pad_id = resolve_qwen3_special_token_ids(tokenizer)
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
     exec_token_id = tokenizer.convert_tokens_to_ids("<EXEC>")
     concept_eos_id = tokenizer.convert_tokens_to_ids("<EOS_CONCEPT>")

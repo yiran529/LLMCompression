@@ -650,3 +650,10 @@ The earliest known reference to the city of Alexandria is found in the 1st centu
   * 用单个样本训练时模型确实能最终完美拟合；
   * 但在某个 step 之前 eval 输出完全跑题，到了某个 step 后突然开始完美重建，显示出 **评估路径/解码吸引子或训练–推理不一致**导致的“突然换轨”。
 一句话概括：**Planner 的概念序列曾发生贪心解码下的退化/模板化，虽然通过混合采样等手段缓解了重复，但 Executor 仍未建立“concept/输入 → 输出”的强条件依赖，导致重建长期语义脱钩；同时 TF 噪声/训练-评估错位可能进一步加剧这种失效。**
+
+
+# 新想法（加快训练，降显存）
+切断前后两个concept tokens之间额的梯度
+
+# 新想法
+训练时用new_kv，但通过辅助损失让new_kv与orig_kv接近。这样既能强迫concept学会承载input的信息，又能方便在推理时用orig_kv（当然，不用也可以）

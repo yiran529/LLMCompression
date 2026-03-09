@@ -98,10 +98,7 @@ def _build_meta_from_state(head_state: dict, tokenizer: AutoTokenizer, device: s
         [concept_ids, torch.tensor([concept_eos_id], device=device, dtype=torch.long)], dim=0
     )
     
-    # 从 tokenizer 获取基础 token IDs
-    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id or tokenizer.bos_token_id
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    bos_id, eos_id, pad_id = resolve_qwen3_special_token_ids(tokenizer)
     plan_token_id = tokenizer.convert_tokens_to_ids("<PLAN>")
     exec_token_id = tokenizer.convert_tokens_to_ids("<EXEC>")
     
