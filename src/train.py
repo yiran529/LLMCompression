@@ -127,19 +127,18 @@ def train():
     ).to(device)
     if RESUME_ENABLED:
         head_state = torch.load(resume_heads_path, map_location=device)
-        if "output_head_base" in head_state:
-            model.output_head_base.load_state_dict(head_state["output_head_base"])
-            if model.output_head_new is not None and head_state.get("output_head_new") is not None:
-                saved_new_weight = head_state["output_head_new"]["weight"]
-                target_rows = model.output_head_new.weight.shape[0]
-                if saved_new_weight.shape[0] != target_rows:
-                    raise RuntimeError(
-                        f"output_head_new rows mismatch: ckpt={saved_new_weight.shape[0]} vs expected={target_rows}. "
-                        "Please use a checkpoint trained with the same concept vocabulary size."
-                    )
-                model.output_head_new.load_state_dict(head_state["output_head_new"])
-        else:
-            raise RuntimeError("No output head state found in checkpoint.")
+        assert "output_head_base" in head_state, "No output head state found in checkpoint."
+        model.output_head_base.load_state_dict(head_state["output_head_base"])
+        if model.output_head_new is not None and head_state.get("output_head_new") is not None:
+            saved_new_weight = head_state["output_head_new"]["weight"]
+            target_rows = model.output_head_new.weight.shape[0]
+            if saved_new_weight.shape[0] != target_rows:
+                raise RuntimeError(
+                    f"output_head_new rows mismatch: ckpt={saved_new_weight.shape[0]} vs expected={target_rows}. "
+                    "Please use a checkpoint trained with the same concept vocabulary size."
+                )
+            model.output_head_new.load_state_dict(head_state["output_head_new"])
+                
         model.type_embed.load_state_dict(head_state["type_embed"])
         token_embed_new = head_state.get("token_embed_new")
         if token_embed_new is not None and token_embed_new.numel() > 0:

@@ -116,6 +116,8 @@ def rollout_concepts_detached(
     use_cache: bool = True,
 ) -> Tuple[PlannerOutput, PlannerSamplingTrace]:
     """Run planner AR rollout without gradients and record stochastic sampling trace."""
+    was_training = model.training
+    model.eval()
     with torch.no_grad():
         bsz, _ = input_ids.shape
         hidden_size = model.hidden_size
@@ -153,8 +155,6 @@ def rollout_concepts_detached(
         eos_id = int(meta.concept_eos_id)
         eos_local_id = int(meta.concept_eos_local_id)
         planner_vocab_size = int(meta.planner_vocab_size)
-
-        concept_table = model.embed_tokens(meta.concept_ids_with_eos)
         type_vec = model.type_embed.weight[int(meta.type_id_concept)].view(1, -1).to(dtype=dtype_embed)
 
         concept_tokens = torch.full((bsz, meta.max_concept_steps), eos_id, device=device, dtype=torch.long)
@@ -215,20 +215,14 @@ def rollout_concepts_detached(
                 break
 
             active_rows = active.nonzero(as_tuple=False).squeeze(1)
-            probs_subset = probs[active_rows]
-            soft_t = torch.matmul(probs_subset.to(concept_table.dtype), concept_table).to(dtype=dtype_embed) + type_vec
             hard_t = model.embed_tokens(sampled_ids[active_rows]).to(dtype=dtype_embed) + type_vec
 
-            soft_embed_step = torch.zeros((bsz, hidden_size), device=device, dtype=dtype_embed)
             hard_embed_step = torch.zeros((bsz, hidden_size), device=device, dtype=dtype_embed)
-            soft_embed_step[active_rows] = soft_t
             hard_embed_step[active_rows] = hard_t
             if torch.any(~active):
                 dummy_ids = torch.full(((~active).sum().item(),), eos_id, device=device, dtype=torch.long)
                 hard_embed_step[~active] = model.embed_tokens(dummy_ids) + type_vec
-                soft_embed_step[~active] = hard_embed_step[~active]
 
-            st_embed = hard_embed_step + (soft_embed_step - soft_embed_step.detach())
             cache_attention_mask = torch.cat(
                 [cache_attention_mask, torch.ones((bsz, 1), device=device, dtype=torch.long)],
                 dim=1,
@@ -236,15 +230,15 @@ def rollout_concepts_detached(
             cache_position_ids = cache_position_ids + 1
 
             out_next = model.forward_backbone(
-                inputs_embeds=st_embed.detach().unsqueeze(1),
+                inputs_embeds=hard_embed_step.unsqueeze(1),
                 attention_mask=cache_attention_mask,
                 position_ids=cache_position_ids,
-                past_key_values=_detach_past_key_values(past_kv),
+                past_key_values=past_kv,
                 use_cache=use_cache,
             )
             logits_t = model.planner_forward_head(out_next.last_hidden_state[:, -1, :])
             logits_t = torch.nan_to_num(logits_t, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-            past_kv = _detach_past_key_values(out_next.past_key_values)
+            past_kv = out_next.past_key_values
 
         actual_lengths = concept_valid.sum(dim=1)
         planner_out = PlannerOutput(
@@ -259,6 +253,8 @@ def rollout_concepts_detached(
             gumbel_noise=gumbel_noise_trace,
             mix_use_greedy=mix_use_greedy_trace,
         )
+    if was_training:
+        model.train()
     return planner_out, rollout_trace
 
 
@@ -388,6 +384,7 @@ def replay_planner_parallel(
     # - accumulate commit/uniform/eos losses
     # - write ST embeddings for executor prefix
     # ----------------------------------------------------------------------
+    # TODO: vectorize this loop for efficiency (currently runs in Python loop for clarity and strict alignment with rollout).
     for step in range(max_steps):
         active = concept_valid[:, step].bool()
         masked_logits = logits_steps[:, step, :].float().clone()
