@@ -85,12 +85,8 @@ def _planner_soft_probs(
     aligned_mix_use_greedy: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if sampling_mode == "gumbel":
-        assert aligned_gumbel_noise is not None, "Missing rollout gumbel noise for strict replay alignment."
         return _gumbel_soft_probs_from_noise(masked_logits, tau, aligned_gumbel_noise)
     if sampling_mode == "mix":
-        _ = mix_greedy_ratio  # Keep signature stable; row selection comes from rollout trace.
-        assert aligned_gumbel_noise is not None, "Missing rollout gumbel noise for strict replay alignment."
-        assert aligned_mix_use_greedy is not None, "Missing rollout mix-greedy mask for strict replay alignment."
         greedy_probs = _normalize_probs(masked_logits)
         tau_probs = _gumbel_soft_probs_from_noise(masked_logits, tau, aligned_gumbel_noise)
         return torch.where(aligned_mix_use_greedy.unsqueeze(1), greedy_probs, tau_probs)
@@ -408,7 +404,7 @@ def replay_planner_parallel(
             forced[:, eos_local_id] = 0.0
             masked_logits[active] = forced
 
-        probs_soft = _planner_soft_probs(
+        probs = _planner_soft_probs(
             masked_logits=masked_logits,
             tau=tau,
             sampling_mode=sampling_mode,
@@ -427,11 +423,8 @@ def replay_planner_parallel(
         sampled_ids_local = sampled_ids_local_all[:, step]
         assert torch.all(sampled_ids_local >= 0) and torch.all(sampled_ids_local < planner_vocab_size), (
             f"sampled_ids_local out of range at step {step}: "
-            f"got [{sampled_ids_local.min().item()}, {sampled_ids_local.max().item()}], "
-            f"expected [0, {planner_vocab_size - 1}]"
+            f"got [{sampled_ids_local.min().item()}, {sampled_ids_local.max().item()}], expected [0, {planner_vocab_size - 1}]"
         )
-        probs_hard = F.one_hot(sampled_ids_local, num_classes=planner_vocab_size).to(dtype=probs_soft.dtype)
-        probs = probs_hard - probs_soft.detach() + probs_soft
 
         active_rows = active.nonzero(as_tuple=False).squeeze(1)
         if active_rows.numel() == 0:

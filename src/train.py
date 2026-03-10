@@ -199,15 +199,31 @@ def train():
     # =========================
     # 8) Dataset and dataloader
     # =========================
-    dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
+    # dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=100000)
+    # collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
+    # dataloader_kwargs = {
+    #     "batch_size": BATCH_SIZE,
+    #     "shuffle": True,
+    #     "num_workers": 8,
+    #     "pin_memory": torch.cuda.is_available(),
+    #     "collate_fn": collate_fn,
+    #     "drop_last": True,
+    #     "prefetch_factor": 4,
+    #     "persistent_workers": True,
+    # }
+    max_samples = SANITY_MAX_SAMPLES if SANITY_MAX_SAMPLES > 0 else None
+    dataset = ParquetSentenceDataset(PARQUET_PATH, max_samples=max_samples)
+    if len(dataset) == 0:
+        raise RuntimeError("Dataset is empty after applying SANITY_MAX_SAMPLES; please increase it or check PARQUET_PATH.")
     collate_fn = Collator(tokenizer=tokenizer, max_len=MAX_INPUT_TOKENS)
+    effective_batch_size = min(BATCH_SIZE, len(dataset))
     dataloader_kwargs = {
-        "batch_size": BATCH_SIZE,
+        "batch_size": effective_batch_size,
         "shuffle": True,
         "num_workers": 8,
         "pin_memory": torch.cuda.is_available(),
         "collate_fn": collate_fn,
-        "drop_last": True,
+        "drop_last": len(dataset) >= effective_batch_size,
         "prefetch_factor": 4,
         "persistent_workers": True,
     }

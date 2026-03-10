@@ -19,24 +19,24 @@ ATTENTION_IMPL = "sdpa"
 FP32_TRAINABLE = "lora_only"
 
 # Gradient Checkpointing (Saves VRAM but slower training)
-USE_GRADIENT_CHECKPOINTING = False
+USE_GRADIENT_CHECKPOINTING = True
 
 BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 40
+BATCH_SIZE = 54
 GRAD_ACCUM = 8
-EPOCHS = 3
+EPOCHS = 5
 LR = 1e-4
 WARMUP_RATIO = 0.1
-MAX_INPUT_TOKENS = 32
+MAX_INPUT_TOKENS = 64
 SEED = 42
 SAVE_STEPS = 200
 LOG_STEPS = 5
 EVAL_STEPS = 100
 EVAL_NUM_SAMPLES = 4
-EVAL_MAX_NEW_TOKENS = 32
+EVAL_MAX_NEW_TOKENS = 64
 EVAL_PLANNER_TAU = 0.2
 EVAL_SKIP_SPECIAL_TOKENS = True
 
@@ -57,7 +57,7 @@ TRAIN_PLANNER_SAMPLING_MODE = "mix"
 # Planner forward mode during training:
 # - "ar": original single-pass autoregressive planner
 # - "two_pass": detached AR rollout + differentiable parallel replay
-TRAIN_PLANNER_FORWARD_MODE = "ar"
+TRAIN_PLANNER_FORWARD_MODE = "two_pass"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.9
@@ -104,8 +104,8 @@ class ConceptConfig:
 
 
 CONCEPT_CONFIG = ConceptConfig(
-    size=1024,
-    max_steps=15,
+    size=4096,
+    max_steps=20,
     target_ratio=0.25,
 )
 
