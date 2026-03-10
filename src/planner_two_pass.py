@@ -199,7 +199,6 @@ def rollout_concepts_detached(
                 mix_greedy_ratio=mix_greedy_ratio,
             )
             if gumbel_noise_trace is not None:
-                assert g_noise is not None
                 gumbel_noise_trace[:, step, :] = g_noise.to(dtype=gumbel_noise_trace.dtype)
             if mix_use_greedy_trace is not None:
                 assert use_greedy is not None
@@ -497,7 +496,6 @@ def plan_concepts_two_pass(
     device: str,
     sampling_mode: str = "gumbel",
     mix_greedy_ratio: float = 0.0,
-    use_cache: bool = True,
 ) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two-pass planner: detached AR rollout + differentiable parallel replay."""
     rollout_out, rollout_trace = rollout_concepts_detached(
@@ -510,7 +508,7 @@ def plan_concepts_two_pass(
         device=device,
         sampling_mode=sampling_mode,
         mix_greedy_ratio=mix_greedy_ratio,
-        use_cache=use_cache,
+        use_cache=True,
     )
     return replay_planner_parallel(
         model,
