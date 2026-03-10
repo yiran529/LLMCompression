@@ -54,6 +54,10 @@ TAU_MIN = 0.2
 MIN_CONCEPT_STEPS = 4
 # Planner sampling mode during training: "gumbel" | "greedy" | "mix".
 TRAIN_PLANNER_SAMPLING_MODE = "mix"
+# Planner forward mode during training:
+# - "ar": original single-pass autoregressive planner
+# - "two_pass": detached AR rollout + differentiable parallel replay
+TRAIN_PLANNER_FORWARD_MODE = "ar"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.9

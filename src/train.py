@@ -17,6 +17,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from src.config.train_config import *
 from src.model import *
+from src.planner_two_pass import plan_concepts_two_pass
 from src.utils.train_utils import *
 
 def train():
@@ -313,6 +314,8 @@ def train():
     global_step = resume_step
     log_every = max(1, LOG_STEPS)
     eval_every = max(0, int(EVAL_STEPS))
+    planner_forward_mode = str(TRAIN_PLANNER_FORWARD_MODE).strip().lower()
+    assert planner_forward_mode in {"ar", "two_pass"}, f"Invalid TRAIN_PLANNER_FORWARD_MODE={TRAIN_PLANNER_FORWARD_MODE}."
     for epoch in range(EPOCHS):
         # ---- [Epoch] reset per-epoch counters ----
         epoch_losses: List[float] = []
@@ -358,17 +361,32 @@ def train():
                     loss_unif,
                     loss_eos,
                     loss_len,
-                ) = plan_concepts(
-                    model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    meta=meta,
-                    tau=tau,
-                    sampling_mode=TRAIN_PLANNER_SAMPLING_MODE,
-                    mix_greedy_ratio=planner_mix_greedy_ratio,
-                    min_concept_steps=MIN_CONCEPT_STEPS,
-                    device=device,
-                    use_cache=not USE_GRADIENT_CHECKPOINTING,
+                ) = (
+                    plan_concepts_two_pass(
+                        model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        meta=meta,
+                        tau=tau,
+                        sampling_mode=TRAIN_PLANNER_SAMPLING_MODE,
+                        mix_greedy_ratio=planner_mix_greedy_ratio,
+                        min_concept_steps=MIN_CONCEPT_STEPS,
+                        device=device,
+                        use_cache=not USE_GRADIENT_CHECKPOINTING,
+                    )
+                    if planner_forward_mode == "two_pass"
+                    else plan_concepts(
+                        model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        meta=meta,
+                        tau=tau,
+                        sampling_mode=TRAIN_PLANNER_SAMPLING_MODE,
+                        mix_greedy_ratio=planner_mix_greedy_ratio,
+                        min_concept_steps=MIN_CONCEPT_STEPS,
+                        device=device,
+                        use_cache=not USE_GRADIENT_CHECKPOINTING,
+                    )
                 )
                 stage_metrics.update(cuda_stage_end("planner", planner_stage_state))
 
