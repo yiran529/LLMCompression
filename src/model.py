@@ -8,7 +8,14 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-from src.config.train_config import BETA_COMMIT, EPS, TYPE_ID_CONCEPT, TYPE_ID_TEXT, ConceptConfig
+from src.config.train_config import (
+    BETA_COMMIT,
+    EPS,
+    PLANNER_REPEAT_LAST_K,
+    TYPE_ID_CONCEPT,
+    TYPE_ID_TEXT,
+    ConceptConfig,
+)
 
 
 # Large enough to suppress a token in softmax without creating extreme numeric ranges.
@@ -100,6 +107,40 @@ def usage_kl_to_uniform(hist: torch.Tensor) -> torch.Tensor:
     z = hist.numel()
     u = torch.full_like(hist, 1.0 / max(1, z))
     return torch.sum(hist * (torch.log(hist + EPS) - torch.log(u + EPS)))
+
+
+def repeat_unlikelihood_loss_from_probs(
+    *,
+    probs: torch.Tensor,
+    repeat_ids: torch.Tensor,
+    eos_local_id: int,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute unlikelihood loss that penalizes assigning mass to repeated IDs."""
+    zero = torch.zeros((), device=probs.device, dtype=torch.float32)
+    if probs.numel() == 0 or repeat_ids.numel() == 0:
+        return zero, zero
+
+    n_rows, vocab_size = probs.shape
+    row_ids = torch.arange(n_rows, device=probs.device, dtype=torch.long)
+    repeat_mask = torch.zeros((n_rows, vocab_size), device=probs.device, dtype=torch.bool)
+
+    for col in range(repeat_ids.size(1)):
+        ids_col = repeat_ids[:, col].to(torch.long)
+        valid = (ids_col >= 0) & (ids_col < vocab_size) & ids_col.ne(int(eos_local_id))
+        if torch.any(valid):
+            repeat_mask[row_ids[valid], ids_col[valid]] = True
+
+    has_repeat = repeat_mask.any(dim=-1)
+    if not torch.any(has_repeat):
+        return zero, zero
+
+    repeat_prob = (probs[has_repeat].float() * repeat_mask[has_repeat].to(torch.float32)).sum(dim=-1)
+    repeat_prob = repeat_prob.clamp(min=0.0, max=1.0 - float(eps))
+    loss_vec = -torch.log1p(-repeat_prob)
+    loss_sum = loss_vec.sum()
+    count = torch.tensor(float(loss_vec.numel()), device=probs.device, dtype=torch.float32)
+    return loss_sum, count
 
 
 def _run_kmeans(weight: torch.Tensor, num_clusters: int, num_iters: int = 20) -> torch.Tensor:
@@ -465,7 +506,7 @@ def plan_concepts(
     sampling_mode: str = "gumbel",
     mix_greedy_ratio: float = 0.0,
     use_cache: bool = True,
-) -> PlannerOutput:
+) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """generate one variable-length concept sequence from source input."""
     # =========================================================================
     # 1. 基础变量初始化与提取
@@ -531,6 +572,8 @@ def plan_concepts(
     hist_sum = torch.zeros((int(meta.concept_ids.numel()),), device=device, dtype=torch.float32)
     eos_sum = torch.zeros((), device=device, dtype=torch.float32)
     eos_count = torch.zeros((), device=device, dtype=torch.float32)
+    repeat_sum = torch.zeros((), device=device, dtype=torch.float32)
+    repeat_count = torch.zeros((), device=device, dtype=torch.float32)
 
     # =========================================================================
     # 5. 初始化自回归 (AR) 生成所需的状态容器
@@ -542,6 +585,12 @@ def plan_concepts(
     concept_valid = torch.zeros((bsz, meta.max_concept_steps), device=device, dtype=torch.long)
     concept_st_embeds = torch.zeros((bsz, meta.max_concept_steps, hidden_size), device=device, dtype=dtype_embed)
     finished = torch.zeros((bsz,), device=device, dtype=torch.bool)
+    recent_local_ids = torch.full(
+        (bsz, max(0, int(PLANNER_REPEAT_LAST_K))),
+        -1,
+        device=device,
+        dtype=torch.long,
+    )
 
     cache_attention_mask = planner_mask
     cache_position_ids = planner_pos[:, -1:].clone() + 1
@@ -553,6 +602,7 @@ def plan_concepts(
         active = ~finished
         if not torch.any(active):
             break
+        active_rows = active.nonzero(as_tuple=False).squeeze(1)
 
         # =====================================================================
         # 6.1 处理边界条件：屏蔽无效 Token 并强制控制输出长度
@@ -594,13 +644,24 @@ def plan_concepts(
         # =====================================================================
         # 6.3 统计与计算当前步的 Loss (CommitLoss, 词频KL, EOS Loss等)
         # =====================================================================
-        active_rows = active.nonzero(as_tuple=False).squeeze(1)
         probs_subset = probs[active_rows]  # [N, K+1]
         hist_sum = hist_sum + probs_subset[:, :-1].sum(dim=0)
+        repeat_step_sum, repeat_step_count = repeat_unlikelihood_loss_from_probs(
+            probs=probs_subset,
+            repeat_ids=recent_local_ids[active_rows],
+            eos_local_id=eos_local_id,
+        )
+        repeat_sum = repeat_sum + repeat_step_sum
+        repeat_count = repeat_count + repeat_step_count
 
         soft_t = torch.matmul(probs_subset.to(concept_table.dtype), concept_table).to(dtype=dtype_embed) + type_vec
         hard_t = model.embed_tokens(sampled_ids[active_rows]).to(dtype=dtype_embed) + type_vec
         st_t = hard_t + (soft_t - soft_t.detach())
+
+        if recent_local_ids.size(1) > 0:
+            if recent_local_ids.size(1) > 1:
+                recent_local_ids[active_rows, 1:] = recent_local_ids[active_rows, :-1]
+            recent_local_ids[active_rows, 0] = sampled_ids_local[active_rows]
 
         soft_f = soft_t.float()
         hard_f = hard_t.float()
@@ -680,6 +741,10 @@ def plan_concepts(
 
     loss_eos = eos_sum / eos_count.clamp_min(1.0)
     loss_len = F.relu(actual_lengths.float() - expected.float()).mean()
+    if float(repeat_count.detach().item()) > 0.0:
+        loss_repeat = repeat_sum / repeat_count.clamp_min(1.0)
+    else:
+        loss_repeat = torch.zeros((), device=device, dtype=torch.float32)
 
     return (
         PlannerOutput(
@@ -689,6 +754,7 @@ def plan_concepts(
         loss_unif,
         loss_eos,
         loss_len,
+        loss_repeat,
     )
 
 def build_executor_prefix(
@@ -817,10 +883,17 @@ def run_executor_inference(
     max_new_tokens: int = 64,
     planner_tau: float = 0.2,
     min_concept_steps: int = 1,
+    planner_sampling_mode: str = "greedy",
+    planner_mix_greedy_ratio: float = 0.0,
 ) -> ExecutorInferenceOutput:
-    """run planner->prefix->executor greedy decoding for inference."""
+    """Run planner->prefix->executor decoding with configurable planner sampling."""
     bsz = input_ids.size(0)
     max_new_tokens = max(0, int(max_new_tokens))
+    sampling_mode = str(planner_sampling_mode).strip().lower()
+    assert sampling_mode in {"greedy", "gumbel", "mix"}, (
+        f"Unsupported planner_sampling_mode={planner_sampling_mode}. "
+        "Use greedy, gumbel, or mix."
+    )
 
     # 从 meta 获取 token IDs
     bos_id = meta.bos_id
@@ -835,7 +908,8 @@ def run_executor_inference(
             attention_mask=attention_mask,
             meta=meta,
             tau=planner_tau,
-            sampling_mode="greedy",
+            sampling_mode=sampling_mode,
+            mix_greedy_ratio=float(planner_mix_greedy_ratio),
             min_concept_steps=min_concept_steps,
             device=device,
         )

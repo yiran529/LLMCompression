@@ -113,11 +113,11 @@ def get_stage2_tf_mask_ratio(
     hi = max(float(ratio_max), float(ratio_min))
     progress = min(1.0, max(0.0, float(global_step) / max(1.0, float(total_steps))))
 
-    if progress <= 0.10:
+    if progress <= 0.30:
         return lo
     if progress >= 0.80:
         return hi
-    local = (progress - 0.10) / 0.70
+    local = (progress - 0.30) / 0.50
     return lo + (hi - lo) * local
 
 
@@ -300,6 +300,8 @@ def _build_wandb_config(
         "eval_num_samples": EVAL_NUM_SAMPLES,
         "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
         "eval_planner_tau": EVAL_PLANNER_TAU,
+        "eval_planner_sampling_mode": EVAL_PLANNER_SAMPLING_MODE,
+        "eval_planner_mix_greedy_ratio": EVAL_PLANNER_MIX_GREEDY_RATIO,
         "enable_stage2_tf_masking": ENABLE_STAGE2_TF_MASKING,
         "stage2_tf_masking_max_ratio": STAGE2_TF_MASKING_MAX_RATIO,
         "stage2_tf_masking_min_ratio": STAGE2_TF_MASKING_MIN_RATIO,
@@ -320,7 +322,9 @@ def _build_wandb_config(
         "lambda_commit": LAMBDA_COMMIT,
         "lambda_unif": LAMBDA_UNIF,
         "lambda_eos": LAMBDA_EOS,
+        "lambda_repeat": LAMBDA_REPEAT,
         "lambda_len": LAMBDA_LEN,
+        "planner_repeat_last_k": PLANNER_REPEAT_LAST_K,
         "lora_r": LORA_R,
         "lora_alpha": LORA_ALPHA,
         "lora_dropout": LORA_DROPOUT,
@@ -576,6 +580,8 @@ def run_periodic_eval(
     wandb_run,
     model_dtype: torch.dtype = torch.float32,
     use_amp: bool = False,
+    planner_sampling_mode: str = "greedy",
+    planner_mix_greedy_ratio: float = 0.0,
 ) -> None:
     sample_count = min(int(EVAL_NUM_SAMPLES), int(input_ids.size(0)))
     if sample_count <= 0:
@@ -600,6 +606,8 @@ def run_periodic_eval(
                 max_new_tokens=EVAL_MAX_NEW_TOKENS,
                 planner_tau=EVAL_PLANNER_TAU,
                 min_concept_steps=MIN_CONCEPT_STEPS,
+                planner_sampling_mode=planner_sampling_mode,
+                planner_mix_greedy_ratio=planner_mix_greedy_ratio,
             )
 
     # Restore training state

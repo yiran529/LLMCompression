@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from src.config.train_config import BETA_COMMIT
+from src.config.train_config import BETA_COMMIT, PLANNER_REPEAT_LAST_K
 from src.model import (
     NEG_INF_LOGIT,
     PlannerOutput,
@@ -13,6 +13,7 @@ from src.model import (
     SharedBackboneUnifiedHead,
     TokenMeta,
     _detach_past_key_values,
+    repeat_unlikelihood_loss_from_probs,
     usage_kl_to_uniform,
 )
 
@@ -270,7 +271,7 @@ def replay_planner_parallel(
     min_concept_steps: int,
     sampling_mode: str = "gumbel",
     mix_greedy_ratio: float = 0.0,
-) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Replay fixed concept rollout with one parallel forward pass and compute planner losses."""
     # ----------------------------------------------------------------------
     # 1) Read basic sizes/dtypes used across replay.
@@ -371,6 +372,8 @@ def replay_planner_parallel(
     hist_sum = torch.zeros((int(meta.concept_ids.numel()),), device=device, dtype=torch.float32)
     eos_sum = torch.zeros((), device=device, dtype=torch.float32)
     eos_count = torch.zeros((), device=device, dtype=torch.float32)
+    repeat_sum = torch.zeros((), device=device, dtype=torch.float32)
+    repeat_count = torch.zeros((), device=device, dtype=torch.float32)
 
     # Lookup tables used to build soft/hard/ST concept embeddings.
     concept_table = model.embed_tokens(concept_ids_with_eos)
@@ -387,6 +390,7 @@ def replay_planner_parallel(
     # TODO: vectorize this loop for efficiency (currently runs in Python loop for clarity and strict alignment with rollout).
     for step in range(max_steps):
         active = concept_valid[:, step].bool()
+        active_rows = active.nonzero(as_tuple=False).squeeze(1)
         masked_logits = logits_steps[:, step, :].float().clone()
 
         if torch.any(~active):
@@ -422,12 +426,29 @@ def replay_planner_parallel(
             f"got [{sampled_ids_local.min().item()}, {sampled_ids_local.max().item()}], expected [0, {planner_vocab_size - 1}]"
         )
 
-        active_rows = active.nonzero(as_tuple=False).squeeze(1)
         if active_rows.numel() == 0:
             continue
 
         probs_subset = probs[active_rows]
         hist_sum = hist_sum + probs_subset[:, :-1].sum(dim=0)
+        repeat_ids = torch.full(
+            (active_rows.numel(), max(0, int(PLANNER_REPEAT_LAST_K))),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+        for back in range(1, int(PLANNER_REPEAT_LAST_K) + 1):
+            prev_step = step - back
+            if prev_step < 0:
+                break
+            repeat_ids[:, back - 1] = sampled_ids_local_all[active_rows, prev_step]
+        repeat_step_sum, repeat_step_count = repeat_unlikelihood_loss_from_probs(
+            probs=probs_subset,
+            repeat_ids=repeat_ids,
+            eos_local_id=eos_local_id,
+        )
+        repeat_sum = repeat_sum + repeat_step_sum
+        repeat_count = repeat_count + repeat_step_count
 
         sampled_ids = concept_tokens[:, step]
         soft_t = torch.matmul(probs_subset.to(concept_table.dtype), concept_table).to(dtype=dtype_embed) + type_vec
@@ -475,11 +496,15 @@ def replay_planner_parallel(
 
     loss_eos = eos_sum / eos_count.clamp_min(1.0)
     loss_len = F.relu(actual_lengths.float() - expected.float()).mean()
+    if float(repeat_count.detach().item()) > 0.0:
+        loss_repeat = repeat_sum / repeat_count.clamp_min(1.0)
+    else:
+        loss_repeat = torch.zeros((), device=device, dtype=torch.float32)
 
     # ----------------------------------------------------------------------
     # 11) Return planner output and auxiliary losses.
     # ----------------------------------------------------------------------
-    return PlannerOutput(concept=concept_out), loss_commit, loss_unif, loss_eos, loss_len
+    return PlannerOutput(concept=concept_out), loss_commit, loss_unif, loss_eos, loss_len, loss_repeat
 
 
 def plan_concepts_two_pass(
@@ -493,7 +518,7 @@ def plan_concepts_two_pass(
     device: str,
     sampling_mode: str = "gumbel",
     mix_greedy_ratio: float = 0.0,
-) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[PlannerOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two-pass planner: detached AR rollout + differentiable parallel replay."""
     rollout_out, rollout_trace = rollout_concepts_detached(
         model,

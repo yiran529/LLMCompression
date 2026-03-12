@@ -360,6 +360,7 @@ def train():
                     loss_unif,
                     loss_eos,
                     loss_len,
+                    loss_repeat,
                 ) = (
                     plan_concepts_two_pass(
                         model,
@@ -459,6 +460,7 @@ def train():
                     + LAMBDA_COMMIT * loss_commit
                     + LAMBDA_UNIF * loss_unif
                     + LAMBDA_EOS * loss_eos
+                    + LAMBDA_REPEAT * loss_repeat
                 ).float()
                 stage_metrics.update(cuda_stage_end("execute", execute_stage_state))
 
@@ -588,6 +590,7 @@ def train():
                         step_extra_metrics["train/stage2_tf_mask_ratio_applied"] = tf_mask_applied_ratio
                     if TRAIN_PLANNER_SAMPLING_MODE == "mix":
                         step_extra_metrics["train/planner_mix_greedy_ratio"] = planner_mix_greedy_ratio
+                    step_extra_metrics["train/loss_repeat"] = float(loss_repeat.detach().cpu())
 
                     logging.info(
                         f"[Epoch {epoch + 1}/{EPOCHS}] "
@@ -597,6 +600,7 @@ def train():
                         f"Commit {float(loss_commit.detach().cpu()):.4f} | "
                         f"Unif {float(loss_unif.detach().cpu()):.4f} | "
                         f"EOS {float(loss_eos.detach().cpu()):.4f} | "
+                        f"Repeat {float(loss_repeat.detach().cpu()):.4f} | "
                         f"Len {float(loss_len.detach().cpu()):.4f} | "
                         f"ConceptLen {avg_len:.2f} | "
                         f"SeqDiv {seq_div_mean:.4f} | "
@@ -644,6 +648,8 @@ def train():
                         wandb_run=wandb_run,
                         model_dtype=model_dtype,
                         use_amp=use_amp,
+                        planner_sampling_mode=EVAL_PLANNER_SAMPLING_MODE,
+                        planner_mix_greedy_ratio=EVAL_PLANNER_MIX_GREEDY_RATIO,
                     )
 
                 if global_step % SAVE_STEPS == 0:

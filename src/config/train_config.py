@@ -28,7 +28,7 @@ OUTPUT_DIR = "./outputs"
 BATCH_SIZE = 96 
 GRAD_ACCUM = 4
 EPOCHS = 5
-LR = 5e-5
+LR = 1e-5
 WARMUP_RATIO = 0.1
 MAX_INPUT_TOKENS = 64
 SEED = 42
@@ -38,6 +38,10 @@ EVAL_STEPS = 100
 EVAL_NUM_SAMPLES = 4
 EVAL_MAX_NEW_TOKENS = 64
 EVAL_PLANNER_TAU = 0.2
+# Planner sampling mode for periodic eval: "greedy" | "gumbel" | "mix".
+EVAL_PLANNER_SAMPLING_MODE = "gumbel"
+# Only used when EVAL_PLANNER_SAMPLING_MODE == "mix".
+EVAL_PLANNER_MIX_GREEDY_RATIO = 0.0
 EVAL_SKIP_SPECIAL_TOKENS = True
 
 # Stage-2 teacher-forcing input masking.
@@ -46,8 +50,8 @@ EVAL_SKIP_SPECIAL_TOKENS = True
 # - 10%~80% steps: linearly increase MIN -> MAX
 # - last 20% steps: keep ratio at MAX
 ENABLE_STAGE2_TF_MASKING = True
-STAGE2_TF_MASKING_MAX_RATIO = 0.15
-STAGE2_TF_MASKING_MIN_RATIO = 0.0
+STAGE2_TF_MASKING_MAX_RATIO = 0.0
+STAGE2_TF_MASKING_MIN_RATIO = 0.05
 
 TAU_INIT = 1.0
 TAU_MIN = 0.2
@@ -60,7 +64,7 @@ TRAIN_PLANNER_SAMPLING_MODE = "mix"
 TRAIN_PLANNER_FORWARD_MODE = "two_pass"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
-TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.4
+TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.2
 # 是否允许 Planner 输出 base tokens（原词表 tokens）
 ALLOW_PLANNER_BASE_TOKENS = False
 
@@ -68,7 +72,10 @@ LAMBDA_REC = 1.0
 LAMBDA_COMMIT = 1.0
 LAMBDA_UNIF = 2.0
 LAMBDA_EOS = 0.2
+# Repeat-token unlikelihood penalty on planner probabilities.
+LAMBDA_REPEAT = 0.1
 LAMBDA_LEN = 0.2
+PLANNER_REPEAT_LAST_K = 3
 BETA_COMMIT = 0.5
 EPS = 1e-8
 
