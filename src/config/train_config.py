@@ -25,8 +25,8 @@ BASE_DIR = "/root/models/qwen3-0.6b"
 PARQUET_PATH = "./data/wikipedia_512.parquet"
 OUTPUT_DIR = "./outputs"
 
-BATCH_SIZE = 96 
-GRAD_ACCUM = 4
+BATCH_SIZE = 192
+GRAD_ACCUM = 1
 EPOCHS = 5
 LR = 1e-5
 WARMUP_RATIO = 0.1
@@ -64,14 +64,14 @@ TRAIN_PLANNER_SAMPLING_MODE = "mix"
 TRAIN_PLANNER_FORWARD_MODE = "two_pass"
 # For TRAIN_PLANNER_SAMPLING_MODE == "mix", greedy row ratio linearly increases MIN -> MAX.
 TRAIN_PLANNER_MIX_GREEDY_RATIO_MIN = 0.0
-TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.2
+TRAIN_PLANNER_MIX_GREEDY_RATIO_MAX = 0.0
 # 是否允许 Planner 输出 base tokens（原词表 tokens）
 ALLOW_PLANNER_BASE_TOKENS = False
 
 LAMBDA_REC = 1.0
 LAMBDA_COMMIT = 1.0
-LAMBDA_UNIF = 2.0
-LAMBDA_EOS = 0.2
+LAMBDA_UNIF = 4.0
+LAMBDA_EOS = 1.0
 # Repeat-token unlikelihood penalty on planner probabilities.
 LAMBDA_REPEAT = 0.1
 LAMBDA_LEN = 0.2

@@ -136,8 +136,10 @@ def repeat_unlikelihood_loss_from_probs(
         return zero, zero
 
     repeat_prob = (probs[has_repeat].float() * repeat_mask[has_repeat].to(torch.float32)).sum(dim=-1)
-    repeat_prob = repeat_prob.clamp(min=0.0, max=1.0 - float(eps))
-    loss_vec = -torch.log1p(-repeat_prob)
+    repeat_prob = repeat_prob.clamp(min=0.0, max=1.0)
+    # Keep a practical distance from 1.0 to avoid -log(0) under highly peaked distributions.
+    safe_margin = max(float(eps), float(torch.finfo(repeat_prob.dtype).eps), 1e-6)
+    loss_vec = -torch.log((1.0 - repeat_prob).clamp_min(safe_margin))
     loss_sum = loss_vec.sum()
     count = torch.tensor(float(loss_vec.numel()), device=probs.device, dtype=torch.float32)
     return loss_sum, count
@@ -745,6 +747,7 @@ def plan_concepts(
         loss_repeat = repeat_sum / repeat_count.clamp_min(1.0)
     else:
         loss_repeat = torch.zeros((), device=device, dtype=torch.float32)
+    loss_repeat = torch.nan_to_num(loss_repeat, nan=0.0, posinf=50.0, neginf=0.0)
 
     return (
         PlannerOutput(

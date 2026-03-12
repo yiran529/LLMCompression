@@ -466,7 +466,16 @@ def train():
 
             # ---- [Guard] skip invalid loss early ----
             if not torch.isfinite(loss):
-                logging.warning("[WARN] non-finite loss, skip batch")
+                logging.warning(
+                    "[WARN] non-finite loss, skip batch | "
+                    f"loss={float(loss.detach().cpu()):.6g}, "
+                    f"rec={float(loss_rec.detach().cpu()):.6g}, "
+                    f"commit={float(loss_commit.detach().cpu()):.6g}, "
+                    f"unif={float(loss_unif.detach().cpu()):.6g}, "
+                    f"eos={float(loss_eos.detach().cpu()):.6g}, "
+                    f"repeat={float(loss_repeat.detach().cpu()):.6g}, "
+                    f"len={float(loss_len.detach().cpu()):.6g}"
+                )
                 optimizer.zero_grad(set_to_none=True)
                 batch = prefetcher.next()
                 continue

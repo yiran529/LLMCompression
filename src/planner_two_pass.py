@@ -500,6 +500,7 @@ def replay_planner_parallel(
         loss_repeat = repeat_sum / repeat_count.clamp_min(1.0)
     else:
         loss_repeat = torch.zeros((), device=device, dtype=torch.float32)
+    loss_repeat = torch.nan_to_num(loss_repeat, nan=0.0, posinf=50.0, neginf=0.0)
 
     # ----------------------------------------------------------------------
     # 11) Return planner output and auxiliary losses.
